@@ -1,0 +1,4 @@
+interface:
+  display_name: "实施项目文书规范"
+  short_description: "生成结构完整、可执行且可审批的客户实施项目文书规范"
+  default_prompt: "Use $create-implementation-project-document to draft a complete SaaS customer implementation project brief."

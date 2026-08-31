@@ -1,0 +1,46 @@
+services:
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://${APP_DB_USER:-saas_app}:${SAAS_APP_DB_PASSWORD:-saas_app}@postgres:5432/${POSTGRES_DB:-saas_agent}
+      MIGRATION_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-saas}:${SAAS_DB_PASSWORD:-saas}@postgres:5432/${POSTGRES_DB:-saas_agent}
+      APP_DB_USER: ${APP_DB_USER:-saas_app}
+      APP_DB_PASSWORD: ${SAAS_APP_DB_PASSWORD:-saas_app}
+      REDIS_URL: redis://redis:6379/0
+      AUTO_CREATE_SCHEMA: "false"
+      COOKIE_SECURE: "false"
+      DEMO_MODE: "false"
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@example.com}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe123!}
+      FRONTEND_BASE_URL: http://localhost:8080
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"], interval: 10s, timeout: 3s, retries: 5}
+  web:
+    build: ./web
+    ports: ["8080:80"]
+    depends_on: [api]
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-saas}
+      POSTGRES_PASSWORD: ${SAAS_DB_PASSWORD:-saas}
+      POSTGRES_DB: ${POSTGRES_DB:-saas_agent}
+      APP_DB_USER: ${APP_DB_USER:-saas_app}
+      APP_DB_PASSWORD: ${SAAS_APP_DB_PASSWORD:-saas_app}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    # Use 5433 on the host to avoid clashing with an existing local PostgreSQL.
+    ports: ["5433:5432"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"], interval: 5s, timeout: 3s, retries: 10}
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    volumes: ["./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports: ["3000:3000"]
+volumes: {postgres_data: {}}

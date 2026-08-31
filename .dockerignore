@@ -1,0 +1,71 @@
+# Version control and local tooling
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+.cursor
+.agents
+.codex
+
+# Secrets and machine-specific configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials*.json
+secrets*.json
+
+# Internal documentation and development-only content
+docs
+tests
+backups
+ops
+skills
+README.md
+
+# Python generated content
+.venv
+venv
+env
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+build
+dist
+*.egg-info
+
+# Runtime data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+*.log
+data
+uploads
+logs
+
+# The API image does not use the frontend source tree
+web
+
+# Temporary and operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.swp
+*.swo
+tmp
+temp

@@ -1,0 +1,93 @@
+# Secrets and deployment-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials*.json
+secrets*.json
+
+# Private or internal documentation
+docs/
+
+# Python environments, caches and build artifacts
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Local databases, runtime data and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+backups/
+data/
+uploads/
+logs/
+*.log
+
+# Frontend dependencies and generated output
+node_modules/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+.vite/
+.vite-inspect/
+.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE and local agent configuration
+.idea/
+.vscode/
+.cursor/
+.agents/
+.codex/
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+tmp/
+temp/

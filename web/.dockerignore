@@ -1,0 +1,32 @@
+# Dependencies and generated output
+node_modules
+dist
+*.tsbuildinfo
+.vite
+.vite-inspect
+.pnpm-store
+
+# Local configuration and logs
+.env
+.env.*
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Version control, editor and OS files
+.git
+.gitignore
+.idea
+.vscode
+.cursor
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
