@@ -121,9 +121,16 @@ async def test_company_admin_can_read_run_but_cannot_decide_without_approver_rol
 
 async def test_invalid_csv_cannot_execute(client):
     p = await project(client)
+    started = await client.post(f"/api/projects/{p['id']}/runs", headers={"Idempotency-Key": str(uuid.uuid4())})
+    run_id = started.json()["data"]["id"]
+    approver = await role_client(client, p["id"], "approver", "csv-approver@example.com")
+    for _ in range(2):
+        item = next(a for a in (await approver.get(f"/api/approvals?run_id={run_id}")).json()["data"] if a["status"] == "pending")
+        assert (await approver.post(f"/api/approvals/{item['id']}/decision", headers={"Idempotency-Key": str(uuid.uuid4())}, json={"decision": "approved", "expected_version": item["version"]})).status_code == 200
+    await approver.aclose()
     consultant = await role_client(client, p["id"], "implementation_consultant", "consultant-1@example.com")
     try:
-        validated = await consultant.post("/api/imports/validate", headers={"Idempotency-Key": str(uuid.uuid4())}, json={"project_id": p["id"], "csv_text": "name,email\nA,bad"})
+        validated = await consultant.post("/api/imports/validate", headers={"Idempotency-Key": str(uuid.uuid4())}, json={"project_id": p["id"], "run_id": run_id, "csv_text": "name,email\nA,bad"})
         job = validated.json()["data"]
         assert job["valid"] is False
         executed = await consultant.post(f"/api/imports/{job['job_id']}/execute", headers={"Idempotency-Key": str(uuid.uuid4())})
@@ -255,8 +262,14 @@ async def test_completed_project_cannot_start_again(client):
     )
     run_id = started.json()["data"]["id"]
     approver = await role_client(client, created["id"], "approver", "approver-3@example.com")
+    consultant = await role_client(client, created["id"], "implementation_consultant", "delivery-consultant@example.com")
     try:
       for _ in range(4):
+        current_run = (await client.get(f"/api/runs/{run_id}")).json()["data"]
+        if current_run["status"] == "preparing_materials":
+            csv_text = "name,email,department,role\n" + "\n".join(f"成员{i},member{i}@example.com,设计部,{'admin' if i == 0 else 'member'}" for i in range(80))
+            uploaded = await consultant.post("/api/imports/validate", headers={"Idempotency-Key": str(uuid.uuid4())}, json={"project_id": created["id"], "run_id": run_id, "csv_text": csv_text})
+            assert uploaded.status_code == 200 and uploaded.json()["data"]["valid"]
         approvals = (await approver.get(f"/api/approvals?run_id={run_id}")).json()["data"]
         pending = next(item for item in approvals if item["status"] == "pending")
         decision = await approver.post(
@@ -272,6 +285,11 @@ async def test_completed_project_cannot_start_again(client):
     summary = (await client.get(f"/api/projects/{created['id']}")).json()["data"]
     assert summary["status"] == "completed"
     assert summary["can_start"] is False
+    delivered = (await client.get(f"/api/projects/{created['id']}/delivery")).json()["data"]
+    await consultant.aclose()
+    assert len(delivered["members"]) == 80
+    assert delivered["configuration"]["notifications.due_date"] is True
+    assert len(delivered["artifacts"]) == 6
     restarted = await client.post(
         f"/api/projects/{created['id']}/runs",
         headers={"Idempotency-Key": str(uuid.uuid4())},

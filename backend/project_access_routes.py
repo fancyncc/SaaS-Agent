@@ -43,6 +43,7 @@ async def _company_member(session: AsyncSession, user_id: str) -> TenantMembersh
     membership = await session.scalar(select(TenantMembership).where(
         TenantMembership.user_id == user_id,
         TenantMembership.status == "active",
+        TenantMembership.workspace_kind == "company",
     ))
     if not membership:
         raise HTTPException(404, "成员不存在或已停用")
@@ -121,6 +122,8 @@ async def add_project_member(
         ProjectMembership.project_id == project.id,
         ProjectMembership.user_id == target.user_id,
     ))
+    if payload.primary_role_code is None:
+        raise HTTPException(422, "必须指定项目角色")
     if item:
         role_code = payload.primary_role_code.value
         item.project_role = item.primary_role_code = role_code
@@ -342,11 +345,14 @@ async def invite_collaborating_company(
 ):
     project = await accessible_project_or_404(session, str(project_id), user)
     await require_project_permission(session, project, user, "collaboration.invite")
+    owner_space = await session.get(Tenant, project.tenant_id)
+    if not owner_space or owner_space.kind != "company":
+        raise HTTPException(403, "个人项目不能添加企业协作")
     target_id = str(payload.tenant_id)
     if target_id == project.tenant_id:
         raise HTTPException(409, "项目主归属公司不能作为协作公司")
     tenant = await session.get(Tenant, target_id)
-    if not tenant or tenant.status != "active" or tenant.deleted_at is not None:
+    if not tenant or tenant.kind != "company" or tenant.status != "active" or tenant.deleted_at is not None:
         raise HTTPException(404, "合作公司不存在")
     item = await session.scalar(select(ProjectCollaboration).where(
         ProjectCollaboration.project_id == project.id,

@@ -12,8 +12,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend import delivery
 from backend.access import (
     accessible_project_filter,
     accessible_project_or_404,
@@ -25,7 +27,10 @@ from backend.audit import audit_event
 from backend.auth_routes import router as auth_router
 from backend.config import get_settings
 from backend.db import bootstrap_identity, get_session, init_db
-from backend.imports import validate_member_csv
+from backend.delivery_routes import router as delivery_router
+from backend.execution import dispatch
+from backend.knowledge_routes import router as knowledge_router
+from backend.member_import_routes import router as member_import_router
 from backend.models import (
     AgentRun,
     AgentStep,
@@ -38,6 +43,7 @@ from backend.models import (
     ProjectMembership,
     Tenant,
 )
+from backend.onboarding import router as onboarding_router
 from backend.platform_routes import router as platform_router
 from backend.project_access_routes import router as project_access_router
 from backend.schemas import (
@@ -63,25 +69,31 @@ from backend.state_machine import (
 )
 from backend.support_routes import platform_router as platform_support_router
 from backend.support_routes import router as support_router
-from backend.workflow import advance, resume_after_approval
+from backend.workflow import resume_after_approval
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    from backend.observability import setup
+    setup()
     await init_db()
     await bootstrap_identity()
     yield
 
 
 app = FastAPI(title=get_settings().app_name, version="1.0.0", lifespan=lifespan)
+from backend.observability import instrument, trace_identifier
+
+app.middleware("http")(instrument)
 app.add_middleware(CORSMiddleware, allow_origins=get_settings().cors_origins.split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.middleware("http")
 async def request_security(request: Request, call_next):
     request.state.request_id = request.headers.get("X-Request-ID", secrets.token_hex(8))
-    request.state.trace_id = request.headers.get("traceparent", secrets.token_hex(16))[-32:]
+    request.state.trace_id = trace_identifier(request.headers.get("traceparent"))
     exempt = {"/api/auth/login", "/api/auth/platform/login", "/api/auth/password/forgot", "/api/auth/password/reset"}
+    exempt.update({"/api/auth/register", "/api/auth/verify-email"})
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
         invitation_path = (request.url.path.startswith("/api/auth/invitations/")
                            or request.url.path.startswith("/api/auth/platform-invitations/"))
@@ -103,11 +115,20 @@ async def request_security(request: Request, call_next):
 
 
 app.include_router(auth_router)
+app.include_router(onboarding_router)
+app.include_router(member_import_router)
 app.include_router(company_router)
 app.include_router(platform_router)
 app.include_router(project_access_router)
 app.include_router(support_router)
 app.include_router(platform_support_router)
+app.include_router(delivery_router)
+app.include_router(knowledge_router)
+
+
+@app.exception_handler(IntegrityError)
+async def identity_conflict(request: Request, exc: IntegrityError):
+    return JSONResponse(status_code=409, content={"detail": "数据发生并发冲突或信息重复，请刷新后重试"})
 
 
 def envelope(request: Request, data: object) -> Envelope:
@@ -142,7 +163,7 @@ async def project_summary(session: AsyncSession, project: Project, user: Princip
         latest_approval = await session.scalar(select(Approval).where(Approval.run_id == latest_run.id, Approval.tenant_id == project.tenant_id).order_by(Approval.created_at.desc()).limit(1))
     status = project.lifecycle_status
     permissions = sorted(access["permissions"])
-    active_run = bool(latest_run and latest_run.status in {"pending", "running", "waiting_approval"})
+    active_run = bool(latest_run and latest_run.status in {"pending", "running", "waiting_approval", "preparing_materials"})
     start_permission = "run.retry" if status == "blocked" else "run.start"
     return {
         "id": project.id, "name": project.name, "customer_name": project.customer_name,
@@ -170,7 +191,18 @@ async def health():
 
 @app.get("/metrics", include_in_schema=False, response_class=PlainTextResponse)
 async def metrics():
-    return "# HELP saas_agent_up Whether the API process is serving requests.\n# TYPE saas_agent_up gauge\nsaas_agent_up 1\n"
+    from prometheus_client import generate_latest
+
+    from backend.db import SessionLocal
+    from backend.models import MailDelivery, WorkflowOutbox
+    lines = [generate_latest().decode(), "saas_agent_up 1"]
+    async with SessionLocal() as session:
+        for model, column, name in ((AgentRun, AgentRun.status, "saas_runs"), (Approval, Approval.status, "saas_approvals"), (ImportJob, ImportJob.status, "saas_imports"), (MailDelivery, MailDelivery.status, "saas_mail")):
+            for status, count in (await session.execute(select(column, func.count()).select_from(model).group_by(column))).all():
+                lines.append(f'{name}{{status="{status}"}} {count}')
+        backlog = await session.scalar(select(func.count()).select_from(WorkflowOutbox).where(WorkflowOutbox.processed.is_(False)))
+        lines.append(f"saas_outbox_pending {backlog}")
+    return "\n".join(lines) + "\n"
 
 
 @app.post("/api/projects")
@@ -179,6 +211,10 @@ async def create_project(payload: ProjectCreate, request: Request, key: str = De
     if existing:
         return envelope(request, existing.response)
     company_name = payload.customer_name
+    if user.workspace_kind == "personal" and (
+        payload.assisting_company_id or (payload.company_id and str(payload.company_id) != user.tenant_id)
+    ):
+        raise HTTPException(403, "个人项目不能绑定企业或企业协作")
     if payload.company_id:
         company = await session.get(Tenant, str(payload.company_id))
         if not company or company.status != "active" or company.deleted_at is not None:
@@ -189,7 +225,7 @@ async def create_project(payload: ProjectCreate, request: Request, key: str = De
         if assisting_company_id == user.tenant_id:
             raise HTTPException(409, "项目归属公司不能作为协助公司")
         assisting_company = await session.get(Tenant, assisting_company_id)
-        if not assisting_company or assisting_company.status != "active" or assisting_company.deleted_at is not None:
+        if not assisting_company or assisting_company.kind != "company" or assisting_company.status != "active" or assisting_company.deleted_at is not None:
             raise HTTPException(404, "所选协助公司不存在或已停用")
     document = payload.model_dump(mode="json")
     document["customer_name"] = company_name
@@ -235,6 +271,20 @@ async def get_project(project_id: UUID, request: Request, user: Principal = Depe
     return envelope(request, await project_summary(session, await project_or_404(session, str(project_id), user), user))
 
 
+@app.get("/api/tasks")
+async def my_tasks(request: Request, user: Principal = Depends(current_principal), session: AsyncSession = Depends(get_session)):
+    runs = (await session.scalars(select(AgentRun).join(Project, AgentRun.project_id == Project.id).where(accessible_project_filter(user), Project.deleted_at.is_(None), AgentRun.status.in_(["preparing_materials", "waiting_approval", "failed", "cancelled"])).order_by(AgentRun.updated_at.desc()))).all()
+    tasks = []
+    for run in runs:
+        latest = await session.scalar(select(func.max(AgentRun.run_number)).where(AgentRun.project_id == run.project_id))
+        if latest != run.run_number:
+            continue
+        actions = await run_actions(session, run, user)
+        if actions:
+            tasks.append({"run_id": run.id, "project_id": run.project_id, "status": run.status, "reason": run.state.get("blocking_reason"), "actions": actions})
+    return envelope(request, tasks)
+
+
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: UUID, request: Request, key: str = Depends(idempotency_key), user: Principal = Depends(current_principal), session: AsyncSession = Depends(get_session)):
     existing = await idempotent(session, user, "delete_project", key)
@@ -262,7 +312,7 @@ async def start_run(project_id: UUID, request: Request, key: str = Depends(idemp
     latest_run = await session.scalar(select(AgentRun).where(AgentRun.project_id == project.id, AgentRun.tenant_id == project.tenant_id).order_by(AgentRun.run_number.desc()).limit(1))
     if project.lifecycle_status in {"completed", "cancelled", "archived"}:
         raise HTTPException(409, "已完成的项目不能再次启动 Agent")
-    if latest_run and latest_run.status in {"pending", "running", "waiting_approval"}:
+    if latest_run and latest_run.status in {"pending", "running", "waiting_approval", "preparing_materials"}:
         raise HTTPException(409, "该项目已有进行中的 Agent，请进入执行详情查看")
     transition_project(project, ProjectLifecycle.IN_PROGRESS)
     next_run_number = (await session.scalar(
@@ -278,10 +328,11 @@ async def start_run(project_id: UUID, request: Request, key: str = Depends(idemp
     )
     session.add(run)
     await session.flush()
-    transition_run(run, RunLifecycle.RUNNING)
-    run.state = ImplementationGraphState(project_id=UUID(project.id), run_id=UUID(run.id)).model_dump(mode="json")
+    if get_settings().execution_mode == "inline":
+        transition_run(run, RunLifecycle.RUNNING)
+    run.state = ImplementationGraphState(project_id=UUID(project.id), run_id=UUID(run.id), status=RunStatus(run.status)).model_dump(mode="json")
     await session.flush()
-    await advance(session, run)
+    await dispatch(session, run)
     data = {"id": run.id, "run_number": run.run_number, "retry_of_run_id": run.retry_of_run_id,
             "status": run.status, "version": run.version, "current_node": run.current_node}
     session.add(IdempotencyRecord(tenant_id=user.tenant_id, scope="start_run", key=key, response=data))
@@ -303,11 +354,12 @@ async def cancel_run(
     run = await run_or_404(session, str(run_id), user)
     project = await project_or_404(session, run.project_id, user)
     await require_project_permission(session, project, user, "run.cancel")
-    run = await session.scalar(
+    locked_run = await session.scalar(
         select(AgentRun).where(AgentRun.id == str(run_id)).with_for_update()
     )
-    if not run or run.status not in {"pending", "running", "waiting_approval"}:
+    if not locked_run or locked_run.status not in {"pending", "running", "waiting_approval", "preparing_materials"}:
         raise HTTPException(409, "只有进行中的 Run 可以取消")
+    run = locked_run
 
     pending_approval = await session.scalar(
         select(Approval).where(
@@ -350,6 +402,8 @@ async def get_run(run_id: UUID, request: Request, user: Principal = Depends(curr
                               "run_number": run.run_number, "retry_of_run_id": run.retry_of_run_id,
                               "status": run.status, "version": run.version,
                               "current_node": run.current_node, "state": run.state,
+                              "blocking_reason": run.state.get("blocking_reason"),
+                              "allowed_actions": await run_actions(session, run, user),
                               "trace_id": run.trace_id})
 
 
@@ -363,23 +417,29 @@ async def get_run_steps(run_id: UUID, request: Request, user: Principal = Depend
 
 
 @app.get("/api/runs/{run_id}/events")
-async def run_events(run_id: UUID, user: Principal = Depends(current_principal), session: AsyncSession = Depends(get_session)):
+async def run_events(run_id: UUID, request: Request, user: Principal = Depends(current_principal), session: AsyncSession = Depends(get_session)):
     await run_or_404(session, str(run_id), user)
+    await session.commit()
     async def stream():
+        from backend.db import SessionLocal
         last = ""
         for _ in range(120):
-            run = await session.scalar(select(AgentRun).where(AgentRun.id == str(run_id)))
-            if not run:
-                yield 'event: error\ndata: {"message":"not found"}\n\n'
+            try:
+                async with SessionLocal() as poll_session:
+                    viewer = await current_principal(request, poll_session)
+                    run = await run_or_404(poll_session, str(run_id), viewer)
+                    current = json.dumps({"status": run.status, "node": run.current_node, "trace_id": run.trace_id, "version": run.version}, ensure_ascii=False)
+                    status = run.status
+                    await poll_session.commit()
+            except HTTPException:
+                yield 'event: error\ndata: {"message":"access revoked"}\n\n'
                 return
-            current = json.dumps({"status": run.status, "node": run.current_node, "trace_id": run.trace_id}, ensure_ascii=False)
             if current != last:
                 yield f"event: run\ndata: {current}\n\n"
                 last = current
-            if run.status in {"succeeded", "failed", "cancelled"}:
+            if status in {"succeeded", "failed", "cancelled"}:
                 return
             await asyncio.sleep(1)
-            await session.refresh(run)
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
@@ -430,14 +490,27 @@ async def decide(approval_id: UUID, payload: ApprovalDecision, request: Request,
         raise HTTPException(404, "Run not found")
     project = await project_or_404(session, run.project_id, user)
     await require_project_permission(session, project, user, "approval.decide")
-    if run.started_by == user.user_id or approval.requested_by in {user.subject, user.user_id}:
+    owner_space = await session.get(Tenant, project.tenant_id)
+    personal_confirmation = bool(owner_space and owner_space.kind == "personal"
+                                 and owner_space.personal_owner_id == user.user_id and project.tenant_id == user.tenant_id)
+    if not personal_confirmation and (run.started_by == user.user_id or approval.requested_by in {user.subject, user.user_id}):
         raise HTTPException(403, "Requester cannot approve their own high-risk operation")
+    if run.status != "waiting_approval":
+        raise HTTPException(409, "Run 不处于等待审批状态")
+    if payload.decision == "rejected" and not payload.comment.strip():
+        raise HTTPException(422, "驳回必须填写整改意见")
+    if payload.decision == "approved":
+        current = await delivery.material(session, project, run, ImplementationGraphState.model_validate(run.state), approval.kind)
+        if current != approval.payload:
+            raise HTTPException(409, "审批材料已变化，请取消本次执行并重新制定方案")
+        if approval.kind == "acceptance" and not current["body"]["ready"]:
+            raise HTTPException(409, "上线检查尚未通过")
     approval.status, approval.comment, approval.decided_by = payload.decision, payload.comment, user.subject
     approval.decided_at, approval.version = datetime.now(UTC), approval.version + 1
     run = await resume_after_approval(session, approval, payload.decision)
     data = {"approval_id": approval.id, "run_id": run.id, "run_status": run.status, "current_node": run.current_node}
     session.add(IdempotencyRecord(tenant_id=user.tenant_id, scope="approval", key=key, response=data))
-    session.add(audit_event(request, user, f"approval.{payload.decision}", approval.id, {"kind": approval.kind, "comment": payload.comment}))
+    session.add(audit_event(request, user, f"approval.{payload.decision}", approval.id, {"kind": approval.kind, "comment": payload.comment, "personal_confirmation": personal_confirmation}))
     await session.commit()
     return envelope(request, data)
 
@@ -449,11 +522,24 @@ async def validate_import(payload: ImportValidateRequest, request: Request, key:
         return envelope(request, existing.response)
     project = await project_or_404(session, str(payload.project_id), user)
     await require_project_permission(session, project, user, "import.validate")
-    result = validate_member_csv(payload.csv_text)
-    job = ImportJob(tenant_id=project.tenant_id, project_id=str(payload.project_id), source_hash=hashlib.sha256(payload.csv_text.encode()).hexdigest(), validation=result.model_dump(mode="json"), csv_text=payload.csv_text)
+    run = await session.scalar(select(AgentRun).where(AgentRun.id == str(payload.run_id), AgentRun.project_id == project.id).with_for_update())
+    if not run or run.tenant_id != project.tenant_id:
+        raise HTTPException(404, "Run 不存在")
+    if run.status != "preparing_materials":
+        raise HTTPException(409, "只能在材料准备阶段上传 CSV；已审批文件不可替换")
+    result = await delivery.validate_csv(session, project, payload.csv_text)
+    job = ImportJob(tenant_id=project.tenant_id, project_id=project.id, run_id=run.id, status="valid" if result["valid"] else "invalid", source_hash=hashlib.sha256(payload.csv_text.encode()).hexdigest(), validation=result, csv_text=payload.csv_text)
     session.add(job)
     await session.flush()
-    data = {"job_id": job.id, **result.model_dump(mode="json")}
+    if result["valid"]:
+        state = ImplementationGraphState.model_validate(run.state)
+        state.import_job_id = UUID(job.id)
+        state.blocking_reason = None
+        state.status = RunStatus.RUNNING
+        run.state = state.model_dump(mode="json")
+        transition_run(run, RunLifecycle.RUNNING)
+        await dispatch(session, run)
+    data = {"job_id": job.id, "run_status": run.status, **result}
     session.add(IdempotencyRecord(tenant_id=user.tenant_id, scope="validate_import", key=key, response=data))
     await session.commit()
     return envelope(request, data)
@@ -469,17 +555,40 @@ async def execute_import(job_id: UUID, request: Request, key: str = Depends(idem
         raise HTTPException(404, "Import job not found")
     project = await project_or_404(session, job.project_id, user)
     await require_project_permission(session, project, user, "import.execute")
-    if not job.validation.get("valid"):
-        raise HTTPException(409, "Invalid CSV cannot be imported")
-    approval = await session.scalar(select(Approval).where(Approval.id == str(approval_id), Approval.tenant_id == project.tenant_id)) if approval_id else None
-    if not approval or approval.kind != "import" or approval.status != "approved":
+    if not approval_id or not job.run_id:
         raise HTTPException(403, "An approved import approval is required")
-    job.status, job.result = "completed", {"successful": job.validation["row_count"], "failed": 0, "verified": True}
+    run = await session.scalar(select(AgentRun).where(AgentRun.id == job.run_id).with_for_update())
+    if not run or run.status in {"failed", "cancelled"}:
+        raise HTTPException(409, "终止任务必须通过新的 Run 整改")
+    job.result = await delivery.execute_csv(session, project, run, ImplementationGraphState.model_validate(run.state), job, str(approval_id))
     data = {"job_id": job.id, **job.result}
     session.add(IdempotencyRecord(tenant_id=user.tenant_id, scope="execute_import", key=key, response=data))
     session.add(audit_event(request, user, "import.executed", job.id, data))
     await session.commit()
     return envelope(request, data)
+
+
+async def run_actions(session: AsyncSession, run: AgentRun, user: Principal) -> list[str]:
+    project = await accessible_project_or_404(session, run.project_id, user, include_deleted=True)
+    if project.deleted_at:
+        return []
+    actions = []
+    owner_space = await session.get(Tenant, project.tenant_id)
+    personal_confirmation = bool(owner_space and owner_space.kind == "personal"
+                                 and owner_space.personal_owner_id == user.user_id and project.tenant_id == user.tenant_id)
+    for action, permission, available in (
+        ("upload_csv", "import.validate", run.status == "preparing_materials"),
+        ("cancel", "run.cancel", run.status in {"pending", "running", "preparing_materials", "waiting_approval"}),
+        ("approve", "approval.decide", run.status == "waiting_approval" and (run.started_by != user.user_id or personal_confirmation)),
+        ("retry", "run.retry", run.status in {"failed", "cancelled"}),
+    ):
+        if available:
+            try:
+                await require_project_permission(session, project, user, permission)
+                actions.append(action)
+            except HTTPException:
+                continue
+    return actions
 
 
 async def latest_run_for_project(session: AsyncSession, project_id: str, user: Principal):
@@ -499,3 +608,8 @@ async def project_plan(project_id: UUID, request: Request, user: Principal = Dep
 async def report(project_id: UUID, request: Request, user: Principal = Depends(current_principal), session: AsyncSession = Depends(get_session)):
     return envelope(request, (await latest_run_for_project(session, str(project_id), user)).state.get("acceptance_report"))
 
+
+# Register last so API routes take precedence over browser history routes.
+from backend.frontend import mount_frontend
+
+mount_frontend(app)

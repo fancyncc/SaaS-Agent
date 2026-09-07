@@ -89,5 +89,6 @@ $RECYCLE.BIN/
 *.swo
 *~
 .cache/
+tests/artifacts/
 tmp/
 temp/

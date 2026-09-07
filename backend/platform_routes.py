@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +38,7 @@ from backend.schemas import (
     TenantCreateRequest,
     TenantUpdateRequest,
 )
-from backend.security import Principal, require_platform_roles, token_hash
+from backend.security import Principal, idempotency_key, require_platform_roles, token_hash
 
 router = APIRouter(prefix="/api/platform", tags=["platform administration"])
 SUPER = "platform_super_admin"
@@ -54,7 +56,7 @@ async def dashboard(
     session: AsyncSession = Depends(get_session),
 ):
     return {"data": {
-        "tenant_count": await session.scalar(select(func.count()).select_from(Tenant).where(Tenant.deleted_at.is_(None))) or 0,
+        "tenant_count": await session.scalar(select(func.count()).select_from(Tenant).where(Tenant.kind == "company", Tenant.deleted_at.is_(None))) or 0,
         "customer_user_count": await session.scalar(select(func.count()).select_from(User).where(User.account_type == "customer", User.deleted_at.is_(None))) or 0,
         "platform_user_count": await session.scalar(select(func.count()).select_from(User).where(User.account_type == "platform", User.deleted_at.is_(None))) or 0,
         "failed_run_count": await session.scalar(select(func.count()).select_from(AgentRun).where(AgentRun.status == "failed")) or 0,
@@ -67,7 +69,7 @@ async def list_tenants(
     session: AsyncSession = Depends(get_session),
 ):
     return {"data": [_tenant_payload(x) for x in (await session.scalars(
-        select(Tenant).order_by(Tenant.created_at.desc())
+        select(Tenant).where(Tenant.kind == "company").order_by(Tenant.created_at.desc())
     )).all()]}
 
 
@@ -94,9 +96,9 @@ async def create_tenant(
     )
     session.add(invitation)
     session.add(audit_event(request, user, "tenant.created", tenant.id, {"name": tenant.name}))
-    await session.commit()
     url = f"{get_settings().frontend_base_url}/accept-invitation?token={quote(raw)}"
-    await send_account_link(invitation.email, "invitation", url)
+    await send_account_link(invitation.email, "invitation", url, session=session)
+    await session.commit()
     data = {**_tenant_payload(tenant), "invitation_id": invitation.id}
     if get_settings().mail_debug:
         data["invitation_url"] = url
@@ -132,7 +134,7 @@ async def list_users(
     session: AsyncSession = Depends(get_session),
 ):
     query = (select(User, TenantMembership, Tenant)
-             .outerjoin(TenantMembership, (TenantMembership.user_id == User.id) & (TenantMembership.status == "active"))
+             .outerjoin(TenantMembership, (TenantMembership.user_id == User.id) & (TenantMembership.status == "active") & (TenantMembership.workspace_kind == "company"))
              .outerjoin(Tenant, Tenant.id == TenantMembership.tenant_id)
              .where(User.deleted_at.is_(None)))
     if q:
@@ -188,10 +190,10 @@ async def transfer_company(
     target = await session.get(Tenant, str(payload.target_tenant_id))
     if not user or user.account_type != "customer" or user.deleted_at is not None:
         raise HTTPException(404, "客户用户不存在")
-    if not target or target.status != "active" or target.deleted_at is not None:
+    if not target or target.kind != "company" or target.status != "active" or target.deleted_at is not None:
         raise HTTPException(404, "目标公司不可用")
     current = await session.scalar(select(TenantMembership).where(
-        TenantMembership.user_id == user.id, TenantMembership.status == "active"
+        TenantMembership.user_id == user.id, TenantMembership.status == "active", TenantMembership.workspace_kind == "company"
     ))
     if current and current.tenant_id == target.id:
         raise HTTPException(409, "用户已经属于目标公司")
@@ -254,13 +256,13 @@ async def revoke_user_sessions(
 ):
     if str(user_id) == principal.user_id:
         raise HTTPException(409, "不能在当前会话中撤销自己的全部会话")
-    result = await session.execute(update(AuthSession).where(
+    revoked_ids = (await session.scalars(update(AuthSession).where(
         AuthSession.user_id == str(user_id), AuthSession.revoked_at.is_(None)
-    ).values(revoked_at=datetime.now(UTC)))
+    ).values(revoked_at=datetime.now(UTC)).returning(AuthSession.id))).all()
     session.add(audit_event(request, principal, "platform.sessions_revoked", str(user_id),
-                            {"count": result.rowcount or 0}))
+                            {"count": len(revoked_ids)}))
     await session.commit()
-    return {"data": {"revoked": result.rowcount or 0}}
+    return {"data": {"revoked": len(revoked_ids)}}
 
 
 @router.get("/staff")
@@ -299,9 +301,9 @@ async def invite_staff(
     await session.flush()
     session.add(audit_event(request, principal, "platform.staff_invited", item.id,
                             {"email": email, "role_code": item.role_code}))
-    await session.commit()
     url = f"{get_settings().frontend_base_url}/accept-platform-invitation?token={quote(raw)}"
-    await send_account_link(email, "platform_invitation", url)
+    await send_account_link(email, "platform_invitation", url, session=session)
+    await session.commit()
     data = {"id": item.id, "expires_at": item.expires_at.isoformat()}
     if get_settings().mail_debug:
         data["invitation_url"] = url
@@ -331,14 +333,47 @@ async def system_status(
 
 @router.post("/evaluations/run")
 async def run_evaluation(
-    _: Principal = Depends(require_platform_roles(SUPER)),
+    request: Request,
+    key: str = Depends(idempotency_key),
+    user: Principal = Depends(require_platform_roles(SUPER)),
     session: AsyncSession = Depends(get_session),
 ):
+    # Serialize requests from one actor before checking the idempotency receipt.
+    await session.execute(select(User.id).where(User.id == user.user_id).with_for_update())
+    request_hash = hashlib.sha256(f"{user.user_id}:{key}".encode()).hexdigest()
+    previous = await session.scalar(select(EvaluationRun).where(EvaluationRun.tenant_id.is_(None), EvaluationRun.result["request_key_hash"].as_string() == request_hash))
+    if previous:
+        return {"data": {"id": previous.id, "status": previous.status, **previous.result}}
     result = run_fixed_evaluation()
+    result["request_key_hash"] = request_hash
     item = EvaluationRun(tenant_id=None, dataset_size=str(result["dataset_size"]), result=result)
     session.add(item)
+    await session.flush()
+    data = {"id": item.id, "status": item.status, **result}
+    session.add(audit_event(request, user, "evaluation.completed", item.id, {"dataset_checksum": result["dataset_checksum"], "mode": result["mode"]}))
     await session.commit()
-    return {"data": {"id": item.id, "status": item.status, **result}}
+    return {"data": data}
+
+
+@router.get("/evaluations")
+async def list_evaluations(
+    _: Principal = Depends(require_platform_roles(SUPER, "platform_auditor")),
+    session: AsyncSession = Depends(get_session),
+):
+    rows = (await session.scalars(select(EvaluationRun).where(EvaluationRun.tenant_id.is_(None)).order_by(EvaluationRun.created_at.desc(), EvaluationRun.id.desc()).limit(100))).all()
+    return {"data": [{"id": row.id, "status": row.status, "created_at": row.created_at.isoformat(), "result": row.result} for row in rows]}
+
+
+@router.get("/evaluations/{evaluation_id}/download")
+async def download_evaluation(
+    evaluation_id: UUID,
+    _: Principal = Depends(require_platform_roles(SUPER, "platform_auditor")),
+    session: AsyncSession = Depends(get_session),
+):
+    item = await session.scalar(select(EvaluationRun).where(EvaluationRun.id == str(evaluation_id), EvaluationRun.tenant_id.is_(None)))
+    if item is None:
+        raise HTTPException(404, "评测不存在")
+    return JSONResponse({"id": item.id, "status": item.status, "created_at": item.created_at.isoformat(), "result": item.result}, headers={"Content-Disposition": f'attachment; filename="evaluation-{item.id}.json"'})
 
 
 @router.get("/inspect/tenants/{tenant_id}/projects")

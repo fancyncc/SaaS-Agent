@@ -101,7 +101,8 @@ async def test_company_transfer_revokes_session_and_project_access(client, platf
             memberships = list((await session.scalars(select(TenantMembership).where(
                 TenantMembership.user_id == member_id
             ))).all())
-            assert len([item for item in memberships if item.status == "active"]) == 1
+            assert len([item for item in memberships if item.status == "active" and item.workspace_kind == "company"]) == 1
+            assert len([item for item in memberships if item.status == "active" and item.workspace_kind == "personal"]) == 1
             project_membership = await session.scalar(select(ProjectMembership).where(
                 ProjectMembership.user_id == member_id, ProjectMembership.project_id == project["id"]
             ))

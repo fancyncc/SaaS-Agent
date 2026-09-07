@@ -58,6 +58,8 @@ class Principal:
     company_role_code: str
     platform_roles: tuple[str, ...]
     session_id: str
+    workspace_kind: str = "company"
+    username: str = ""
 
 
 async def create_session(
@@ -124,6 +126,8 @@ async def current_principal(
         if (user.account_type != "customer" or not tenant or tenant.status != "active"
                 or tenant.deleted_at is not None or not membership):
             raise HTTPException(401, "账号或租户不可用")
+        if tenant.kind == "personal" and tenant.personal_owner_id != user.id:
+            raise HTTPException(401, "个人空间不可用")
         role = Role.TENANT_ADMIN if membership.company_role_code == "company_admin" else Role.TENANT_MEMBER
     if session.bind and session.bind.dialect.name == "postgresql":
         await session.execute(text("SELECT set_config('app.current_user_id', :value, true)"), {"value": user.id})
@@ -133,8 +137,8 @@ async def current_principal(
         await session.execute(text("SELECT set_config('app.platform_roles', :value, true)"), {"value": ",".join(platform_roles)})
     return Principal(
         user_id=user.id,
-        subject=user.email,
-        email=user.email,
+        subject=user.email or user.username,
+        email=user.email or "",
         display_name=user.display_name,
         tenant_id=tenant.id if tenant else None,
         tenant_name=tenant.name if tenant else None,
@@ -145,6 +149,8 @@ async def current_principal(
         company_role_code=membership.company_role_code if membership else "",
         platform_roles=platform_roles,
         session_id=auth.id,
+        workspace_kind=tenant.kind if tenant else "company",
+        username=user.username,
     )
 
 
@@ -182,6 +188,12 @@ async def require_platform_staff(user: Principal = Depends(current_principal)) -
 async def require_company_admin(user: Principal = Depends(current_principal)) -> Principal:
     if user.session_context != "customer" or user.company_role_code != "company_admin":
         raise HTTPException(403, "只有公司管理员可以执行该操作")
+    return user
+
+
+async def require_enterprise_admin(user: Principal = Depends(require_company_admin)) -> Principal:
+    if user.workspace_kind != "company":
+        raise HTTPException(403, "请先切换到公司空间")
     return user
 
 

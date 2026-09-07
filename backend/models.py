@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -33,7 +34,14 @@ class Base(DeclarativeBase):
 
 class Tenant(Base):
     __tablename__ = "customer_tenants"
+    __table_args__ = (
+        UniqueConstraint("id", "kind", name="uq_tenant_id_kind"),
+        CheckConstraint("kind IN ('personal','company')", name="ck_tenant_kind"),
+        CheckConstraint("(kind = 'personal' AND personal_owner_id IS NOT NULL) OR (kind = 'company' AND personal_owner_id IS NULL)", name="ck_tenant_owner_kind"),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    kind: Mapped[str] = mapped_column(String(20), default="company", server_default="company")
+    personal_owner_id: Mapped[str | None] = mapped_column(String(36), unique=True)
     name: Mapped[str] = mapped_column(String(120))
     slug: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
@@ -46,9 +54,16 @@ class Tenant(Base):
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (CheckConstraint("account_type IN ('platform','customer')", name="ck_user_account_type"),)
+    __table_args__ = (
+        CheckConstraint("account_type IN ('platform','customer')", name="ck_user_account_type"),
+        Index("uq_users_email_normalized", text("lower(trim(email))"), unique=True),
+        Index("uq_users_username_normalized", text("lower(trim(username))"), unique=True),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    email: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    username: Mapped[str] = mapped_column(String(40), unique=True, default=lambda: f"u_{uuid4().hex}")
+    email: Mapped[str | None] = mapped_column(String(160), unique=True, index=True, nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True)
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     display_name: Mapped[str] = mapped_column(String(100))
     password_hash: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
@@ -65,17 +80,19 @@ class TenantMembership(Base):
     __tablename__ = "tenant_memberships"
     __table_args__ = (
         UniqueConstraint("tenant_id", "user_id"),
+        ForeignKeyConstraint(["tenant_id", "workspace_kind"], ["customer_tenants.id", "customer_tenants.kind"], name="fk_membership_workspace_kind"),
         Index(
             "uq_active_company_per_user",
             "user_id",
             unique=True,
-            postgresql_where=text("status = 'active'"),
-            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active' AND workspace_kind = 'company'"),
+            sqlite_where=text("status = 'active' AND workspace_kind = 'company'"),
         ),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    workspace_kind: Mapped[str] = mapped_column(String(20), default="company", server_default="company")
     role: Mapped[str] = mapped_column(String(40), index=True)
     company_role_code: Mapped[str] = mapped_column(ForeignKey("role_definitions.code"), default="company_member", index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
@@ -85,6 +102,8 @@ class TenantMembership(Base):
 
 class UserInvitation(Base):
     __tablename__ = "user_invitations"
+    __table_args__ = (Index("uq_pending_company_invitation", "tenant_id", "email", unique=True,
+                           postgresql_where=text("status = 'pending'"), sqlite_where=text("status = 'pending'")),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
     email: Mapped[str] = mapped_column(String(160), index=True)
@@ -95,6 +114,40 @@ class UserInvitation(Base):
     invited_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EmailVerification(Base):
+    __tablename__ = "email_verifications"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    email: Mapped[str] = mapped_column(String(160), index=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CompanyDirectoryEntry(Base):
+    """One employee identity shared by pending invitations and activated members."""
+    __tablename__ = "company_directory_entries"
+    __table_args__ = (UniqueConstraint("tenant_id", "email"), UniqueConstraint("tenant_id", "employee_number"))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    email: Mapped[str] = mapped_column(String(160))
+    display_name: Mapped[str] = mapped_column(String(100))
+    department: Mapped[str] = mapped_column(String(100))
+    employee_number: Mapped[str | None] = mapped_column(String(80))
+
+
+class CompanyMemberImport(Base):
+    __tablename__ = "company_member_imports"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    rows: Mapped[list] = mapped_column(JSON)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="validated")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -302,7 +355,7 @@ class AgentRun(Base):
     __table_args__ = (
         UniqueConstraint("project_id", "run_number", name="uq_agent_run_project_number"),
         CheckConstraint(
-            "status IN ('pending','running','waiting_approval','succeeded','failed','cancelled')",
+            "status IN ('pending','running','preparing_materials','waiting_approval','succeeded','failed','cancelled')",
             name="ck_agent_run_status",
         ),
     )
@@ -382,11 +435,130 @@ class ImportJob(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("implementation_projects.id"), index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id", name="fk_import_run"), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="validated")
     source_hash: Mapped[str] = mapped_column(String(64))
     validation: Mapped[dict] = mapped_column(JSON)
     csv_text: Mapped[str] = mapped_column(Text)
     result: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SaaSWorkspace(Base):
+    __tablename__ = "saas_workspaces"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("implementation_projects.id"), unique=True)
+    configuration: Mapped[dict] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class SaaSMember(Base):
+    __tablename__ = "saas_members"
+    __table_args__ = (UniqueConstraint("workspace_id", "email"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("saas_workspaces.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    email: Mapped[str] = mapped_column(String(160))
+    department: Mapped[str] = mapped_column(String(120))
+    role: Mapped[str] = mapped_column(String(40))
+
+
+class ToolExecution(Base):
+    __tablename__ = "tool_executions"
+    __table_args__ = (UniqueConstraint("project_id", "kind", "material_hash"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("implementation_projects.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    material_hash: Mapped[str] = mapped_column(String(64))
+    before: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProjectArtifact(Base):
+    __tablename__ = "project_artifacts"
+    __table_args__ = (UniqueConstraint("run_id", "kind", "checksum"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("implementation_projects.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(60))
+    title: Mapped[str] = mapped_column(String(160))
+    version: Mapped[int] = mapped_column(Integer)
+    checksum: Mapped[str] = mapped_column(String(64))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProjectFeedback(Base):
+    __tablename__ = "project_feedback"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("implementation_projects.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True)
+    author: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkflowOutbox(Base):
+    __tablename__ = "workflow_outbox"
+    __table_args__ = (UniqueConstraint("run_id", "run_version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True)
+    run_version: Mapped[int] = mapped_column(Integer)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (UniqueConstraint("tenant_id", "title", "version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    version: Mapped[int] = mapped_column(Integer)
+    module: Mapped[str] = mapped_column(String(60))
+    source: Mapped[str] = mapped_column(String(500))
+    license: Mapped[str] = mapped_column(String(500))
+    body: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    embedding: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    embedding_model: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MailDelivery(Base):
+    __tablename__ = "mail_deliveries"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    email: Mapped[str] = mapped_column(String(160))
+    purpose: Mapped[str] = mapped_column(String(80))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RemediationTask(Base):
+    __tablename__ = "remediation_tasks"
+    __table_args__ = (UniqueConstraint("project_id", "check_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("customer_tenants.id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("implementation_projects.id"), index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), index=True)
+    check_name: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuditEvent(Base):

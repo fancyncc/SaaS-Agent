@@ -39,6 +39,7 @@ class ProjectRole(StrEnum):
 
 
 class RunStatus(StrEnum):
+    PREPARING_MATERIALS = "preparing_materials"
     PENDING = "pending"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
@@ -73,6 +74,23 @@ class ImplementationPlan(BaseModel):
     milestones: list[MilestoneSpec] = Field(min_length=1)
     assumptions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_dependencies(self):
+        names = {m.name for m in self.milestones}
+        if len(names) != len(self.milestones):
+            raise ValueError("里程碑名称必须唯一")
+        remaining = {m.name: set(m.dependencies) for m in self.milestones}
+        if any(not deps <= names for deps in remaining.values()):
+            raise ValueError("里程碑依赖不存在")
+        completed: set[str] = set()
+        while remaining:
+            ready = {name for name, deps in remaining.items() if deps <= completed}
+            if not ready:
+                raise ValueError("里程碑依赖存在环路")
+            completed.update(ready)
+            remaining = {name: deps for name, deps in remaining.items() if name not in ready}
+        return self
 
 
 class ConfigurationChange(BaseModel):
@@ -143,6 +161,7 @@ class ImplementationGraphState(BaseModel):
     acceptance_report: AcceptanceReport | None = None
     pending_approval_id: UUID | None = None
     completed_nodes: list[str] = Field(default_factory=list)
+    blocking_reason: str | None = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -216,6 +235,7 @@ class Envelope(BaseModel):
 
 class ImportValidateRequest(BaseModel):
     project_id: UUID
+    run_id: UUID
     csv_text: str = Field(min_length=1)
 
     @field_validator("csv_text")
@@ -227,13 +247,23 @@ class ImportValidateRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(min_length=5, max_length=160)
+    email: str | None = Field(default=None, min_length=3, max_length=160)
+    username: str | None = Field(default=None, min_length=3, max_length=160)
     password: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def identifier_required(self):
+        if not self.email and not self.username:
+            raise ValueError("请填写账号")
+        if self.email and self.username and self.email.strip().lower() != self.username.strip().lower():
+            raise ValueError("账号字段不能冲突")
+        return self
 
 
 class InvitationAcceptRequest(BaseModel):
-    display_name: str = Field(min_length=2, max_length=100)
-    password: str = Field(min_length=10, max_length=128)
+    username: str | None = Field(default=None, min_length=3, max_length=40, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
+    display_name: str = Field(default="", max_length=100)
+    password: str = Field(default="", max_length=128)
 
 
 class PasswordForgotRequest(BaseModel):

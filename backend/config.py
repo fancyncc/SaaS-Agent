@@ -24,6 +24,25 @@ class Settings(BaseSettings):
     legacy_tenant_name: str = "Legacy Demo"
     mail_debug: bool = True
     frontend_base_url: str = "http://localhost:8080"
+    execution_mode: str = "inline"
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_starttls: bool = False
+    smtp_from: str = "implementation@example.test"
+    storage_backend: str = "database"
+    s3_endpoint: str = "http://localhost:9000"
+    s3_bucket: str = "delivery"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    model_mode: str = "deterministic"
+    model_base_url: str = ""
+    model_name: str = ""
+    model_api_key: str = ""
+    model_timeout: int = 30
+    embedding_model: str = ""
+    otel_exporter_otlp_endpoint: str = ""
 
 
 @lru_cache

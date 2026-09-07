@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
-from backend.rag import search
+from backend.rag import CORPUS, search
 
 DATASET = Path(__file__).parent.parent / "evaluations" / "cases.jsonl"
 
 
 def run_fixed_evaluation(path: Path = DATASET) -> dict:
-    cases = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    source = path.read_bytes()
+    cases = [json.loads(line) for line in source.decode("utf-8").splitlines() if line]
     categories = Counter(case["category"] for case in cases)
     duplicate_ids = len(cases) - len({case["id"] for case in cases})
     rag_cases = [case for case in cases if case["category"] == "rag"]
@@ -22,6 +25,10 @@ def run_fixed_evaluation(path: Path = DATASET) -> dict:
         rag_hits += int(passed)
         details.append({"id": case["id"], "passed": passed, "retrieved": retrieved})
     return {
+        "mode": "deterministic_retrieval",
+        "dataset_checksum": hashlib.sha256(source).hexdigest(),
+        "corpus_checksum": hashlib.sha256(json.dumps([asdict(chunk) for chunk in CORPUS], ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+        "evaluator_version": "fixed-rag-v1",
         "dataset_size": len(cases),
         "categories": dict(sorted(categories.items())),
         "duplicate_ids": duplicate_ids,

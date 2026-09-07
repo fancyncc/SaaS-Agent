@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import HTTPException
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, false, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models import (
@@ -16,6 +16,7 @@ from backend.models import (
     RolePermission,
     SupportAccessGrant,
     SupportAccessGrantPermission,
+    Tenant,
 )
 from backend.security import Principal
 
@@ -124,7 +125,7 @@ def accessible_project_filter(user: Principal):
         ),
     )
     company_or_member = or_(
-        user.company_role_code == "company_admin",
+        true() if user.company_role_code == "company_admin" else false(),
         exists().where(
             ProjectMembership.project_id == Project.id,
             ProjectMembership.user_id == user.user_id,
@@ -178,6 +179,10 @@ async def project_access(session: AsyncSession, project: Project, user: Principa
             role_codes.add(membership.primary_role_code)
             source = "project_membership"
     permissions = await _role_permissions(session, role_codes)
+    owner_space = await session.get(Tenant, project.tenant_id)
+    if (owner_space and owner_space.kind == "personal" and owner_space.personal_owner_id == user.user_id
+            and project.tenant_id == user.tenant_id and user.session_context == "customer"):
+        permissions.update(await _role_permissions(session, {"project_manager", "implementation_consultant", "approver"}))
     if membership:
         permissions.update((await session.scalars(select(ProjectCapabilityGrant.permission_code).where(
             ProjectCapabilityGrant.membership_id == membership.id,

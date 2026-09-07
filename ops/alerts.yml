@@ -1,0 +1,18 @@
+groups:
+  - name: delivery
+    rules:
+      - alert: ApiDown
+        expr: up{job="api"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "实施 API 不可用"}
+      - alert: OutboxBacklog
+        expr: saas_outbox_pending > 10
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "实施队列积压"}
+      - alert: ApiErrorRate
+        expr: sum(rate(saas_api_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(saas_api_requests_total[5m])), 1) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "API 错误率超过 5%"}

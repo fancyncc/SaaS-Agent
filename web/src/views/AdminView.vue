@@ -84,7 +84,7 @@ async function load() {
     audit.value = await api(`/api/company/audit-events${scope}`)
     pendingCollaborations.value = await api('/api/project-collaborations/pending')
     supportGrants.value = await api('/api/company/support-access-grants')
-  } catch (e: any) { error.value = e.message }
+  } catch (e: any) { error.value = e.message === 'Failed to fetch' ? '暂时无法连接服务，请确认服务已启动后重新加载。' : e.message }
 }
 
 async function createTenant() {
@@ -290,6 +290,11 @@ async function revokeCollaboration(item: any) {
 }
 
 onMounted(load)
+async function updateMember(item:any, values:any) {
+  if (!window.confirm('确认调整成员身份或状态？权限将立即按新设置生效。')) return
+  try { await api(`/api/company/members/${item.membership_id}`, {method:'PATCH', headers:writeHeaders(), body:JSON.stringify(values)}); await load() }
+  catch(e:any) { error.value=e.message }
+}
 </script>
 
 <template>
@@ -298,20 +303,21 @@ onMounted(load)
       <div><span class="eyebrow">COMPANY SETTINGS</span><h1>公司设置</h1><p>管理本公司成员、项目权限、协作和审计。</p></div>
       <router-link class="secondary" to="/app">返回实施项目</router-link>
     </div>
-    <p v-if="error" class="alert alert-danger">{{error}}</p>
+    <div v-if="error" class="alert alert-danger" role="alert">{{error}} <button class="secondary" @click="load">重新加载</button></div>
     <p v-if="message" class="alert alert-success">{{message}}</p>
     <nav class="admin-tabs">
       <button v-for="item in [['overview','总览'],['members','成员与邀请'],['projects','项目与回收站'],['support','支持访问'],['audit','审计']]" :key="item[0]" :class="{active:tab===item[0]}" @click="tab=item[0]">{{item[1]}}</button>
     </nav>
 
+    <div v-if="tab==='overview'" class="overview-toolbar"><div><h2>公司概况</h2><p>当前空间的成员、项目与执行状态。</p></div><a class="secondary" href="/api/company/exports/tenant" download="company-export.json">导出公司数据 ↓</a></div>
     <section v-if="tab==='overview'" class="admin-grid">
-      <article class="metric"><strong>{{dashboard.tenant_count||0}}</strong><span>租户</span></article>
-      <article class="metric"><strong>{{dashboard.active_user_count||0}}</strong><span>有效用户</span></article>
-      <article class="metric"><strong>{{dashboard.failed_run_count||0}}</strong><span>失败 Run</span></article>
+      <article class="metric"><strong>{{dashboard.tenant_count ?? '—'}}</strong><span>公司空间</span></article>
+      <article class="metric"><strong>{{dashboard.active_user_count ?? '—'}}</strong><span>有效成员</span></article>
+      <article class="metric"><strong>{{dashboard.failed_run_count ?? '—'}}</strong><span>失败执行</span></article>
       <article class="metric"><strong>{{Object.values(dashboard.project_statuses||{}).reduce((a:any,b:any)=>a+b,0)}}</strong><span>项目</span></article>
     </section>
 
-    <section v-if="tab==='members'" class="panel admin-section">
+    <section v-if="tab==='members'" class="panel admin-section"><router-link to="/app/company/member-imports">批量导入公司成员</router-link>
       <div class="admin-section-heading"><div><h2>成员与邀请</h2><p>邀请链接 48 小时有效且只能使用一次。生产环境由邮件发送，本地开发请复制链接给受邀人。</p></div></div>
       <form class="inline-form" @submit.prevent="inviteMember">
         <input v-model="invite.email" type="email" placeholder="邮箱" required><input v-model="invite.display_name" placeholder="姓名（选填）">
@@ -324,7 +330,7 @@ onMounted(load)
       </div>
       <p class="invitation-tip">受邀人打开链接后填写姓名和新密码，点击“接受邀请并登录”即可加入当前企业。管理员不要代替受邀人设置密码。</p>
       <h3>现有成员</h3>
-      <table><thead><tr><th>成员</th><th>邮箱</th><th>公司身份</th><th>状态</th></tr></thead><tbody><tr v-for="x in members.members" :key="x.membership_id"><td>{{x.display_name}}</td><td>{{x.email}}</td><td>{{companyRoleNames[x.role] || x.role}}</td><td>{{x.status}}</td></tr></tbody></table>
+      <table><thead><tr><th>成员</th><th>邮箱</th><th>公司身份</th><th>状态</th><th>操作</th></tr></thead><tbody><tr v-for="x in members.members" :key="x.membership_id"><td>{{x.display_name}}</td><td>{{x.email}}</td><td>{{companyRoleNames[x.role] || x.role}}</td><td>{{x.status}}</td><td><button class="secondary" @click="updateMember(x,{status:x.status==='active'?'disabled':'active'})">{{x.status==='active'?'停用':'启用'}}</button><button class="secondary" @click="updateMember(x,{role:x.role==='tenant_admin'?'tenant_member':'tenant_admin'})">切换公司身份</button></td></tr></tbody></table>
       <h3>邀请记录</h3>
       <div v-if="!members.invitations.length" class="empty-mini">当前没有邀请记录</div>
       <div v-else class="table-scroll"><table class="invitation-table"><thead><tr><th>受邀人</th><th>预设角色</th><th>发起人</th><th>邀请时间</th><th>有效期 / 接受时间</th><th>状态</th><th>操作</th></tr></thead><tbody>

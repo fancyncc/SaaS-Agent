@@ -23,7 +23,7 @@ async def enforce_rate_limit(key: str, limit: int, window_seconds: int) -> None:
         if Redis is None:
             raise RuntimeError("redis client unavailable")
         if _redis is None:
-            _redis = Redis.from_url(get_settings().redis_url, decode_responses=True)
+            _redis = Redis.from_url(get_settings().redis_url, decode_responses=True, socket_connect_timeout=0.2, socket_timeout=0.2)
         count = await _redis.incr(key)
         if count == 1:
             await _redis.expire(key, window_seconds)

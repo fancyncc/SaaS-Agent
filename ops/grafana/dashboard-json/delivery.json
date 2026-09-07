@@ -1,0 +1,10 @@
+{
+  "uid": "delivery", "title": "实施交付运行状态", "schemaVersion": 39, "version": 1,
+  "time": {"from": "now-6h", "to": "now"}, "refresh": "15s",
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "API P95（秒）", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(saas_api_seconds_bucket[5m])) by (le))"}]},
+    {"id": 2, "type": "timeseries", "title": "待处理执行任务", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "saas_outbox_pending"}]},
+    {"id": 3, "type": "timeseries", "title": "运行状态", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "saas_runs", "legendFormat": "{{status}}"}]},
+    {"id": 4, "type": "timeseries", "title": "邮件投递", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}, "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "saas_mail", "legendFormat": "{{status}}"}]}
+  ]
+}

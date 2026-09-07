@@ -3,17 +3,19 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import AgentRun, AgentStep, Approval, AuditEvent, Project
-from backend.rag import search
+from backend import delivery
+from backend.config import get_settings
+from backend.intelligence import PROMPT_VERSION, ExtractedRequirements, GapAssessment, structured
+from backend.knowledge_routes import retrieve
+from backend.models import AgentRun, AgentStep, Approval, ImportJob, Project
 from backend.schemas import (
-    AcceptanceReport,
     ApprovalKind,
     ConfigurationChange,
     GapAnalysisItem,
-    GoLiveCheckResult,
     ImplementationGraphState,
     ImplementationPlan,
     MilestoneSpec,
@@ -55,7 +57,7 @@ def _extract_requirements(text: str) -> list[RequirementSpec]:
     lowered = text.lower()
     for category, terms in rules.items():
         if any(term in lowered for term in terms):
-            found.append(RequirementSpec(category=category, statement=f"客户需要{category}相关能力"))
+            found.append(RequirementSpec(category=category, statement=text.strip()))
     # 项目创建已经完成必填校验。未命中预设关键词不代表资料缺失，
     # 应保留客户原始描述作为通用需求，继续进入分析与人工审批。
     return found or [RequirementSpec(category="general", statement=text.strip())]
@@ -78,7 +80,9 @@ async def _record(session: AsyncSession, run: AgentRun, node: str, detail: dict)
     await session.flush()
 
 
-async def advance(session: AsyncSession, run: AgentRun) -> AgentRun:
+async def advance(session: AsyncSession, run: AgentRun, *, one_node: bool = False) -> AgentRun:
+    if run.status != "running":
+        raise HTTPException(409, "只有运行中的任务可以推进")
     state = ImplementationGraphState.model_validate(run.state)
     project = await session.get(Project, run.project_id)
     if not project:
@@ -93,17 +97,27 @@ async def advance(session: AsyncSession, run: AgentRun) -> AgentRun:
         detail: dict = {}
         if node == "collect_requirements":
             state.requirements = _extract_requirements(project.requirements_text)
-            detail = {"count": len(state.requirements), "agent": "Requirement Agent"}
+            if get_settings().model_mode != "deterministic":
+                extracted = await structured("提取实施需求，source 必须标识客户原文", {"requirements": project.requirements_text}, ExtractedRequirements)
+                state.requirements = extracted.requirements
+                state.requirements.append(RequirementSpec(category="original", statement=project.requirements_text))
+            detail = {"count": len(state.requirements), "agent": "Requirement Agent", "prompt_version": PROMPT_VERSION, "mode": get_settings().model_mode}
         elif node == "retrieve_product_knowledge":
             query = " ".join(r.statement for r in state.requirements)
-            detail = {"citations": search(query)}
+            detail = {"citations": await retrieve(session, project.tenant_id, query)}
         elif node == "gap_analysis":
             items = []
             for req in state.requirements:
-                evidence = search(req.statement, limit=2)
+                evidence = await retrieve(session, project.tenant_id, req.statement, limit=2)
                 items.append(GapAnalysisItem(requirement=req.statement, capability=evidence[0]["title"] if evidence else None,
-                    fit="supported" if evidence else "human_review", evidence_ids=[e["id"] for e in evidence],
-                    recommendation="按标准能力配置" if evidence else "证据不足，转人工确认"))
+                    fit="human_review", evidence_ids=[e["id"] for e in evidence],
+                    recommendation="已召回候选资料，请独立核对能力适配" if evidence else "证据不足，转人工确认"))
+                if get_settings().model_mode != "deterministic" and evidence:
+                    assessed = await structured("评估这一条需求的能力差距；requirement 必须原样返回；只能引用提供的证据 ID，证据不能证明时返回 human_review", {"requirement": req.statement, "evidence": evidence}, GapAssessment)
+                    item = assessed.items[0]
+                    if item.requirement != req.statement or not set(item.evidence_ids) <= {e["id"] for e in evidence} or (item.fit in {"supported", "partial"} and not item.evidence_ids):
+                        raise HTTPException(422, "差距分析引用或需求不匹配，需要人工复核")
+                    items[-1] = item
             state.gap_items = items
         elif node == "generate_implementation_plan":
             state.plan = ImplementationPlan(milestones=[
@@ -111,30 +125,51 @@ async def advance(session: AsyncSession, run: AgentRun) -> AgentRun:
                 MilestoneSpec(name="配置与迁移", days=5, owner_role="implementation_consultant", dependencies=["调研与方案"]),
                 MilestoneSpec(name="培训与上线", days=2, owner_role="customer_contact", dependencies=["配置与迁移"]),
             ], assumptions=["客户审批人在两个工作日内反馈"], risks=["源数据质量可能影响迁移"])
+            if get_settings().model_mode != "deterministic":
+                state.plan = await structured("根据客户原文和差距制定里程碑、依赖、负责人、风险和假设，不得声称已执行", {"requirements": project.requirements_text, "gaps": [g.model_dump() for g in state.gap_items]}, ImplementationPlan)
+            await delivery.artifact(session, project, run, "plan", "实施计划", state.plan.model_dump_json(indent=2))
         elif node == "inspect_tenant_configuration":
-            detail = {"workspace": project.customer_name, "status_flow": ["待办", "进行中", "完成"]}
+            ws = await delivery.workspace(session, project)
+            detail = {"workspace_id": ws.id, "version": ws.version, "configuration": ws.configuration}
         elif node == "generate_configuration_changes":
+            ws = await delivery.workspace(session, project)
             state.configuration_changes = [
-                ConfigurationChange(path="workflow.statuses", old_value=["待办", "进行中", "完成"], new_value=["待办", "进行中", "审核中", "完成"], risk="high", reason="匹配客户审批流"),
-                ConfigurationChange(path="notifications.due_date", old_value=False, new_value=True, risk="medium", reason="启用到期提醒"),
+                ConfigurationChange(path="workflow.statuses", old_value=ws.configuration["workflow.statuses"], new_value=["待办", "进行中", "审核中", "完成"], risk="high", reason="标准实施建议，由独立审批人核对客户需求"),
+                ConfigurationChange(path="notifications.due_date", old_value=ws.configuration["notifications.due_date"], new_value=True, risk="medium", reason="标准实施建议：启用到期提醒"),
             ]
         elif node == "apply_configuration":
-            detail = {"snapshot": "before-change", "verified": True, "applied": len(state.configuration_changes)}
-            session.add(AuditEvent(tenant_id=run.tenant_id, event_type="tenant.configuration.applied", actor="agent", resource_id=project.id, payload=detail))
+            detail = await delivery.apply_configuration(session, project, run, state)
         elif node == "validate_import_files":
-            detail = {"status": "skipped" if not state.import_job_id else "validated", "reason": "可通过导入 API 附加 CSV"}
+            job = await session.get(ImportJob, str(state.import_job_id)) if state.import_job_id else None
+            if await delivery.migration_required(session, project) and not (job and job.validation.get("valid")):
+                state.blocking_reason = "请上传有效的成员 CSV，包含项目规定的部门、角色和管理员"
+                state.status = RunStatus.PREPARING_MATERIALS
+                transition_run(run, RunLifecycle.PREPARING_MATERIALS)
+                run.current_node = node
+                run.state = state.model_dump(mode="json")
+                await session.flush()
+                return run
+            detail = {"status": "validated" if job else "skipped", "reason": "材料已校验" if job else "项目无需成员迁移"}
         elif node == "execute_import":
-            detail = {"status": "skipped" if not state.import_job_id else "executed"}
+            job = await session.get(ImportJob, str(state.import_job_id)) if state.import_job_id else None
+            detail = await delivery.execute_csv(session, project, run, state, job) if job else {"status": "skipped", "reason": "项目无需成员迁移"}
         elif node == "generate_training_materials":
-            detail = {"materials": ["管理员快速入门", "成员操作指南", "常见问题 FAQ"]}
+            detail = await delivery.training(session, project, run)
         elif node == "run_go_live_checks":
-            checks = [
-                GoLiveCheckResult(name="实施计划已审批", passed=True, details="审批记录有效"),
-                GoLiveCheckResult(name="租户配置已验证", passed=True, details="操作后检查通过"),
-                GoLiveCheckResult(name="培训材料已生成", passed=True, details="3 份材料"),
-            ]
-            state.acceptance_report = AcceptanceReport(ready=all(c.passed for c in checks), checks=checks)
+            state.acceptance_report = await delivery.go_live_checks(session, project, run, state)
+            await delivery.sync_remediation(session, project, run, state.acceptance_report)
+            await delivery.artifact(session, project, run, "acceptance", "上线验收报告", state.acceptance_report.model_dump_json(indent=2))
+            if not state.acceptance_report.ready:
+                state.blocking_reason = "；".join(state.acceptance_report.blockers)
+                state.status = RunStatus.FAILED
+                transition_run(run, RunLifecycle.FAILED)
+                transition_project(project, ProjectLifecycle.BLOCKED)
+                await _record(session, run, node, state.acceptance_report.model_dump())
+                run.state = state.model_dump(mode="json")
+                return run
         elif node == "close_project":
+            await delivery.require_receipt(session, project, run, state, "acceptance")
+            await delivery.artifact(session, project, run, "summary", "实施总结", f"# {project.name}\n\n项目已通过独立验收。\n\nRun: {run.id}\n\n" + state.model_dump_json(indent=2))
             transition_project(project, ProjectLifecycle.COMPLETED)
             state.status = RunStatus.SUCCEEDED
             transition_run(run, RunLifecycle.SUCCEEDED)
@@ -144,7 +179,7 @@ async def advance(session: AsyncSession, run: AgentRun) -> AgentRun:
                 tenant_id=run.tenant_id,
                 run_id=run.id,
                 kind=APPROVAL_NODES[node].value,
-                payload={"node": node},
+                payload=await delivery.material(session, project, run, state, APPROVAL_NODES[node].value),
                 requested_by=run.started_by or "agent",
             )
             session.add(approval)
@@ -161,6 +196,9 @@ async def advance(session: AsyncSession, run: AgentRun) -> AgentRun:
         await _record(session, run, node, detail)
         state.completed_nodes.append(node)
         run.state = state.model_dump(mode="json")
+        if one_node:
+            await session.flush()
+            return run
 
     await session.flush()
     return run
@@ -185,4 +223,5 @@ async def resume_after_approval(session: AsyncSession, approval: Approval, decis
     transition_run(run, RunLifecycle.RUNNING)
     run.state = state.model_dump(mode="json")
     await session.flush()
-    return await advance(session, run)
+    from backend.execution import dispatch
+    return await dispatch(session, run)

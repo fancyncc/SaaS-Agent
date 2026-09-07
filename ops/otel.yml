@@ -1,0 +1,14 @@
+receivers:
+  otlp:
+    protocols:
+      http: {endpoint: "0.0.0.0:4318"}
+exporters:
+  debug: {verbosity: basic}
+processors:
+  batch: {}
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.models import AgentRun, AgentStep, Approval, ImportJob, Project, ProjectDocument
+from backend.models import (
+    AgentRun,
+    Base,
+    Project,
+    ProjectMembership,
+    SaaSWorkspace,
+    SupportAccessGrant,
+)
 
 
 async def purge_expired_projects(session: AsyncSession) -> int:
@@ -16,12 +23,27 @@ async def purge_expired_projects(session: AsyncSession) -> int:
     ))).all()
     for project in projects:
         run_ids = list(await session.scalars(select(AgentRun.id).where(AgentRun.project_id == project.id)))
-        if run_ids:
-            await session.execute(delete(Approval).where(Approval.run_id.in_(run_ids)))
-            await session.execute(delete(AgentStep).where(AgentStep.run_id.in_(run_ids)))
-            await session.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
-        await session.execute(delete(ImportJob).where(ImportJob.project_id == project.id))
-        await session.execute(delete(ProjectDocument).where(ProjectDocument.project_id == project.id))
+        workspace_ids = list(await session.scalars(select(SaaSWorkspace.id).where(SaaSWorkspace.project_id == project.id)))
+        membership_ids = list(await session.scalars(select(ProjectMembership.id).where(ProjectMembership.project_id == project.id)))
+        grant_ids = list(await session.scalars(select(SupportAccessGrant.id).where(SupportAccessGrant.target_project_id == project.id)))
+        await session.execute(update(AgentRun).where(AgentRun.project_id == project.id).values(retry_of_run_id=None))
+        # Delete only rows explicitly belonging to this expired project, child first.
+        for table in reversed(Base.metadata.sorted_tables):
+            if table.name == Project.__tablename__:
+                continue
+            conditions = {"project_id": project.id, "target_project_id": project.id}
+            matched = False
+            for column, value in conditions.items():
+                if column in table.c:
+                    await session.execute(delete(table).where(table.c[column] == value))
+                    matched = True
+                    break
+            if matched:
+                continue
+            for column, values in (("run_id", run_ids), ("workspace_id", workspace_ids), ("membership_id", membership_ids), ("grant_id", grant_ids)):
+                if column in table.c and values:
+                    await session.execute(delete(table).where(table.c[column].in_(values)))
+                    break
         await session.delete(project)
     await session.commit()
     return len(projects)

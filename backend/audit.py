@@ -20,7 +20,7 @@ def audit_event(
     return AuditEvent(
         tenant_id=user.tenant_id,
         event_type=event_type,
-        actor=user.email,
+        actor=user.email or user.username,
         actor_user_id=user.user_id,
         resource_id=str(resource_id),
         request_id=getattr(request.state, "request_id", ""),

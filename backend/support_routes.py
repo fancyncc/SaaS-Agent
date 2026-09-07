@@ -80,11 +80,11 @@ async def support_targets(
     session: AsyncSession = Depends(get_session),
 ):
     if session.bind and session.bind.dialect.name == "postgresql":
-        rows = (await session.execute(text(
+        directory_rows = (await session.execute(text(
             "SELECT id,name,customer_name FROM support_project_directory "
             "WHERE tenant_id=:tenant_id ORDER BY name"
         ), {"tenant_id": str(tenant_id)})).mappings().all()
-        return {"data": [dict(item) for item in rows]}
+        return {"data": [dict(item) for item in directory_rows]}
     rows = (await session.scalars(select(Project).where(
         Project.tenant_id == str(tenant_id), Project.deleted_at.is_(None),
     ).order_by(Project.name))).all()

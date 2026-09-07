@@ -8,6 +8,8 @@ import type { Project, ProjectDocument } from '../types'
 const router = useRouter()
 const auth = useAuthStore()
 const projects = ref<Project[]>([])
+const projectQuery = ref(''), statusFilter = ref('')
+const filteredProjects = computed(() => projects.value.filter(p => (!statusFilter.value || p.lifecycle_status === statusFilter.value) && `${p.name} ${p.customer_name}`.toLowerCase().includes(projectQuery.value.toLowerCase())))
 const loading = ref(false)
 const error = ref('')
 const success = ref('')
@@ -42,7 +44,7 @@ const statusMeta: Record<string, { label: string; tone: string }> = {
   completed: { label: '已完成', tone: 'success' }, cancelled: { label: '已取消', tone: 'neutral' },
   archived: { label: '已归档', tone: 'neutral' },
 }
-const executionMeta: Record<string, string> = { pending:'等待执行', running:'执行中', waiting_approval:'等待审批', succeeded:'执行成功', failed:'执行失败', cancelled:'已取消' }
+const executionMeta: Record<string, string> = { preparing_materials:'等待成员材料', pending:'等待执行', running:'执行中', waiting_approval:'等待审批', succeeded:'执行成功', failed:'执行失败', cancelled:'已取消' }
 const meta = (status: string) => statusMeta[status] || { label: status, tone: 'neutral' }
 
 async function refresh() { projects.value = await api<Project[]>('/api/projects') }
@@ -145,9 +147,10 @@ onMounted(async () => {
 
     <section class="panel projects-panel">
       <div class="section-heading projects-heading"><div><span class="step-number">02</span><div><h2>实施项目</h2><p>状态、审批结果和可执行动作集中展示。</p></div></div><button class="text-button" @click="refresh">刷新项目</button></div>
-      <div v-if="!projects.length" class="empty-state"><strong>还没有实施项目</strong><p>请先完成上方项目文书。</p></div>
+      <div class="inline-form"><input v-model="projectQuery" placeholder="按项目或客户名称筛选"><select v-model="statusFilter"><option value="">全部状态</option><option v-for="(item,code) in statusMeta" :key="code" :value="code">{{item.label}}</option></select></div>
+      <div v-if="!filteredProjects.length" class="empty-state"><strong>没有匹配的实施项目</strong><p>请调整筛选或创建项目。</p></div>
       <div v-else class="project-list">
-        <article v-for="project in projects" :key="project.id" class="project-card" :class="`project-${meta(project.lifecycle_status).tone}`">
+        <article v-for="project in filteredProjects" :key="project.id" class="project-card" :class="`project-${meta(project.lifecycle_status).tone}`">
           <button v-if="project.permissions?.includes('project.delete')" class="delete-project-button" @click="removeProject(project)">删除项目</button>
           <div class="project-main"><div class="project-top"><span class="status-pill" :class="`pill-${meta(project.lifecycle_status).tone}`"><i></i>{{meta(project.lifecycle_status).label}}</span><span v-if="project.execution_status" class="project-id">Run #{{project.latest_run?.run_number}} · {{executionMeta[project.execution_status] || project.execution_status}}</span><span class="project-id">#{{project.id.slice(0,8)}}</span></div><h3>{{project.name}}</h3><p class="customer">{{project.customer_name}}</p><div v-if="project.document" class="project-meta"><span>{{project.document.employee_count}} 人</span><span>计划 {{project.document.target_go_live_date}} 上线</span></div>
             <div v-if="project.lifecycle_status === 'blocked'" class="rejection-box"><strong>项目已阻塞</strong><p>{{project.latest_approval?.comment || '请进入执行详情查看失败原因并修订后重试。'}}</p></div>

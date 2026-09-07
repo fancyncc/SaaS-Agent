@@ -21,6 +21,7 @@ from backend.models import (
     AgentStep,
     Approval,
     AuditEvent,
+    CompanyDirectoryEntry,
     ImportJob,
     Project,
     ProjectCollaboration,
@@ -30,6 +31,7 @@ from backend.models import (
     User,
     UserInvitation,
 )
+from backend.rate_limit import enforce_rate_limit
 from backend.schemas import (
     InvitationCreateRequest,
     MembershipUpdateRequest,
@@ -45,7 +47,10 @@ router = APIRouter(prefix="/api/company", tags=["company administration"])
 def _tenant_scope(user: Principal, requested: str | None = None) -> str:
     if requested and requested != user.tenant_id:
         raise HTTPException(403, "不能管理其他租户")
-    return requested or user.tenant_id
+    scope = requested or user.tenant_id
+    if not scope:
+        raise HTTPException(403, "公司上下文缺失")
+    return scope
 
 
 async def _tenant_or_404(session: AsyncSession, tenant_id: str) -> Tenant:
@@ -82,7 +87,7 @@ async def dashboard(
         "data": {
             "tenant_count": tenant_count or 0,
             "active_user_count": await session.scalar(user_query) or 0,
-            "project_statuses": dict(projects),
+            "project_statuses": {status: count for status, count in projects},
             "failed_run_count": await session.scalar(runs_query) or 0,
         }
     }
@@ -105,7 +110,7 @@ async def company_directory(
     user: Principal = Depends(require_company_admin), session: AsyncSession = Depends(get_session)
 ):
     rows = (await session.scalars(
-        select(Tenant).where(Tenant.status == "active", Tenant.deleted_at.is_(None)).order_by(Tenant.name)
+        select(Tenant).where(Tenant.kind == "company", Tenant.status == "active", Tenant.deleted_at.is_(None)).order_by(Tenant.name)
     )).all()
     return {"data": [{"id": item.id, "name": item.name} for item in rows]}
 
@@ -135,9 +140,9 @@ async def create_tenant(
     )
     session.add(invitation)
     session.add(audit_event(request, user, "tenant.created", tenant.id, {"name": tenant.name}))
-    await session.commit()
     url = f"{get_settings().frontend_base_url}/accept-invitation?token={quote(raw)}"
-    await send_account_link(invitation.email, "invitation", url)
+    await send_account_link(invitation.email, "invitation", url, session=session)
+    await session.commit()
     data = {"id": tenant.id, "name": tenant.name, "slug": tenant.slug,
             "invitation_id": invitation.id}
     if get_settings().mail_debug:
@@ -232,6 +237,8 @@ async def list_members(
         await session.scalars(select(User).where(User.email.in_(invitation_emails)))
     ).all() if invitation_emails else []
     accepted_by_email = {member.email: member for member in accepted_users}
+    directory = {entry.email: entry for entry in (await session.scalars(select(CompanyDirectoryEntry).where(
+        CompanyDirectoryEntry.tenant_id == scope))).all()}
     now = datetime.now(UTC)
 
     def invitation_data(item: UserInvitation, inviter: User | None) -> dict:
@@ -253,10 +260,15 @@ async def list_members(
             "accepted_at": item.accepted_at.isoformat() if item.accepted_at else None,
             "accepted_user_id": accepted_user.id if accepted_user else None,
             "accepted_user_name": accepted_user.display_name if accepted_user else None,
+            "department": directory[item.email].department if item.email in directory else "",
+            "employee_number": directory[item.email].employee_number if item.email in directory else None,
         }
     return {"data": {"members": [
         {"membership_id": membership.id, "user_id": member.id, "email": member.email,
-         "display_name": member.display_name, "role": membership.role,
+         "display_name": directory[member.email].display_name if member.email in directory else member.display_name,
+         "department": directory[member.email].department if member.email in directory else "",
+         "employee_number": directory[member.email].employee_number if member.email in directory else None,
+         "role": membership.role,
          "company_role_code": membership.company_role_code, "status": membership.status}
         for membership, member in rows
     ], "invitations": [invitation_data(item, inviter) for item, inviter in invitation_rows]}}
@@ -269,15 +281,22 @@ async def create_invitation(
     user: Principal = Depends(require_company_admin),
     session: AsyncSession = Depends(get_session),
 ):
+    if user.workspace_kind != "company":
+        raise HTTPException(403, "个人空间不能添加公司成员")
+    await enforce_rate_limit(f"member-invite:{user.tenant_id}", 30, 3600)
+    await session.scalar(select(Tenant).where(Tenant.id == user.tenant_id).with_for_update())
     if user.is_platform_admin and payload.tenant_id and str(payload.tenant_id) != user.tenant_id:
         raise HTTPException(403, "平台管理员不能替其他公司邀请普通成员")
     scope = _tenant_scope(user, str(payload.tenant_id) if payload.tenant_id else None)
     email = payload.email.strip().lower()
     existing_user = await session.scalar(select(User).where(User.email == email))
     if existing_user:
+        if existing_user.account_type != "customer" or existing_user.status != "active" or existing_user.deleted_at:
+            raise HTTPException(409, "该账号不可加入")
         membership = await session.scalar(select(TenantMembership).where(
             TenantMembership.user_id == existing_user.id,
             TenantMembership.status == "active",
+            TenantMembership.workspace_kind == "company",
         ))
         if membership:
             message = "该用户已是当前公司成员" if membership.tenant_id == scope else "一个账号只能属于一家公司"
@@ -289,6 +308,7 @@ async def create_invitation(
     ))
     if pending:
         pending.status = "revoked"
+        await session.flush()
     raw = secrets.token_urlsafe(48)
     item = UserInvitation(
         tenant_id=scope,
@@ -302,13 +322,24 @@ async def create_invitation(
     session.add(item)
     await session.flush()
     session.add(audit_event(request, user, "invitation.created", item.id, {"email": email, "company_role": item.role, "tenant_id": scope}))
-    await session.commit()
     url = f"{get_settings().frontend_base_url}/accept-invitation?token={quote(raw)}"
-    await send_account_link(email, "invitation", url)
+    await send_account_link(email, "invitation", url, session=session)
+    await session.commit()
     data = {"id": item.id, "expires_at": item.expires_at.isoformat()}
     if get_settings().mail_debug:
         data["invitation_url"] = url
     return {"data": data}
+
+
+async def _release_unused_directory_entry(session: AsyncSession, tenant_id: str, email: str) -> None:
+    await session.flush()
+    pending = await session.scalar(select(UserInvitation.id).where(UserInvitation.tenant_id == tenant_id,
+        UserInvitation.email == email, UserInvitation.status == "pending"))
+    member = await session.scalar(select(TenantMembership.id).join(User, User.id == TenantMembership.user_id).where(
+        TenantMembership.tenant_id == tenant_id, User.email == email))
+    if not pending and not member:
+        await session.execute(delete(CompanyDirectoryEntry).where(
+            CompanyDirectoryEntry.tenant_id == tenant_id, CompanyDirectoryEntry.email == email))
 
 
 @router.post("/invitations/{invitation_id}/revoke")
@@ -324,6 +355,7 @@ async def revoke_invitation(
     if item.status != "pending":
         raise HTTPException(409, "邀请已失效")
     item.status = "revoked"
+    await _release_unused_directory_entry(session, item.tenant_id, item.email)
     session.add(audit_event(request, user, "invitation.revoked", item.id, {"email": item.email}))
     await session.commit()
     return {"data": {"revoked": True}}
@@ -336,12 +368,14 @@ async def resend_invitation(
     user: Principal = Depends(require_company_admin),
     session: AsyncSession = Depends(get_session),
 ):
+    await enforce_rate_limit(f"member-resend:{user.tenant_id}", 30, 3600)
     previous = await session.get(UserInvitation, str(invitation_id))
     if not previous or previous.tenant_id != _tenant_scope(user, previous.tenant_id):
         raise HTTPException(404, "邀请不存在")
     if previous.status == "accepted":
         raise HTTPException(409, "已接受的邀请不能重发")
     previous.status = "revoked"
+    await session.flush()
     raw = secrets.token_urlsafe(48)
     item = UserInvitation(tenant_id=previous.tenant_id, email=previous.email,
                           display_name=previous.display_name, role=previous.role,
@@ -350,9 +384,9 @@ async def resend_invitation(
     session.add(item)
     await session.flush()
     session.add(audit_event(request, user, "invitation.resent", item.id, {"email": item.email}))
-    await session.commit()
     url = f"{get_settings().frontend_base_url}/accept-invitation?token={quote(raw)}"
-    await send_account_link(item.email, "invitation", url)
+    await send_account_link(item.email, "invitation", url, session=session)
+    await session.commit()
     data = {"id": item.id, "expires_at": item.expires_at.isoformat()}
     if get_settings().mail_debug:
         data["invitation_url"] = url
@@ -379,6 +413,7 @@ async def delete_invitation(
     }
     session.add(audit_event(request, user, "invitation.deleted", item.id, snapshot))
     await session.delete(item)
+    await _release_unused_directory_entry(session, item.tenant_id, item.email)
     await session.commit()
     return {"data": {"deleted": True, "id": str(invitation_id)}}
 
@@ -391,6 +426,8 @@ async def update_member(
     user: Principal = Depends(require_company_admin),
     session: AsyncSession = Depends(get_session),
 ):
+    if user.workspace_kind != "company":
+        raise HTTPException(403, "个人空间身份不能修改")
     membership = await session.get(TenantMembership, str(membership_id))
     if not membership or membership.tenant_id != _tenant_scope(user, membership.tenant_id):
         raise HTTPException(404, "成员不存在")
@@ -423,14 +460,16 @@ async def member_password_reset(
     member = await session.get(User, membership.user_id)
     if not member:
         raise HTTPException(404, "用户不存在")
+    if not member.email:
+        raise HTTPException(409, "用户尚未绑定邮箱")
     from backend.models import PasswordResetToken
     raw = secrets.token_urlsafe(48)
     session.add(PasswordResetToken(user_id=member.id, token_hash=token_hash(raw),
                                    expires_at=datetime.now(UTC) + timedelta(hours=1)))
     session.add(audit_event(request, user, "member.password_reset_requested", member.id, {"email": member.email}))
-    await session.commit()
     url = f"{get_settings().frontend_base_url}/reset-password?token={quote(raw)}"
-    await send_account_link(member.email, "password-reset", url)
+    await send_account_link(member.email, "password-reset", url, session=session)
+    await session.commit()
     return {"data": {"sent": True, **({"preview_url": url} if get_settings().mail_debug else {})}}
 
 
@@ -556,8 +595,8 @@ async def export_audit_events(
 
 @router.get("/exports/tenant")
 async def export_tenant_data(
+    request: Request,
     tenant_id: UUID | None = None,
-    request: Request = None,
     user: Principal = Depends(require_company_admin),
     session: AsyncSession = Depends(get_session),
 ):

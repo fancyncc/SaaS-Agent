@@ -44,6 +44,12 @@ async function createTenant() {
     tenantForm.value = {name:'', slug:'', admin_email:'', admin_name:'公司管理员'}; await load()
   } catch(e:any) { error.value = e.message }
 }
+async function changeTenantStatus(item:any) {
+  const status = item.status === 'active' ? 'suspended' : 'active'
+  if (!window.confirm(`确定${status === 'active' ? '恢复' : '暂停'} ${item.name}？暂停后公司成员不能登录或继续执行。`)) return
+  try { await api(`/api/platform/tenants/${item.id}`, {method:'PATCH', headers:writeHeaders(), body:JSON.stringify({status})}); await load() }
+  catch(e:any) { error.value=e.message }
+}
 async function transferUser() {
   if (!selectedUser.value) return
   if (!window.confirm(`确定将 ${selectedUser.value.email} 转移到所选公司吗？旧会话和旧项目权限将立即失效。`)) return
@@ -91,8 +97,8 @@ onMounted(load)
 </script>
 
 <template><main class="admin-page page-wrap platform-page">
-  <div class="admin-title"><div><span class="eyebrow">PLATFORM GOVERNANCE</span><h1>平台管理后台</h1><p>公司治理、用户纠错、平台人员、审计与只读排障。</p></div></div>
-  <p v-if="error" class="alert alert-danger">{{error}}</p><p v-if="message" class="alert alert-success">{{message}}</p>
+  <header class="governance-header"><div class="governance-heading"><span class="eyebrow">PLATFORM GOVERNANCE</span><h1>平台管理后台</h1><p>管理公司与人员，追踪平台运行，安全处理客户支持。</p></div><div class="governance-actions"><router-link v-if="isSuper || auth.user?.platform_roles.includes('platform_auditor')" class="evaluation-entry" to="/platform/evaluations"><span aria-hidden="true">▥</span> 评测历史与对比 <span aria-hidden="true">↗</span></router-link><span class="scope-note">平台治理与客户业务权限独立</span></div></header>
+  <div v-if="error" class="platform-notice notice-error" role="alert"><span class="notice-icon" aria-hidden="true">!</span><div><strong>操作未完成</strong><p>{{error}}</p></div><button aria-label="关闭错误提示" @click="error=''">×</button></div><div v-if="message" class="platform-notice notice-success" role="status"><span class="notice-icon" aria-hidden="true">✓</span><div><strong>操作已完成</strong><p>{{message}}</p></div><button aria-label="关闭成功提示" @click="message=''">×</button></div>
   <div v-if="latestLink" class="invitation-delivery"><code>{{latestLink}}</code><button class="secondary" @click="copyLink">复制链接</button></div>
   <nav class="admin-tabs"><button v-for="item in [['overview','总览'],['tenants','公司'],['users','客户用户'],['staff','平台人员'],['inspect','客户只读检查'],['support','支持访问'],['audit','全局审计'],['system','系统状态']]" :key="item[0]" :class="{active:tab===item[0]}" @click="tab=item[0]">{{item[1]}}</button></nav>
 
@@ -100,7 +106,7 @@ onMounted(load)
 
   <section v-if="tab==='tenants'" class="panel admin-section"><h2>公司治理</h2>
     <form v-if="canGovern" class="inline-form tenant-create-form" @submit.prevent="createTenant"><input v-model="tenantForm.name" required minlength="2" placeholder="公司名称"><input v-model="tenantForm.slug" required placeholder="company-slug"><input v-model="tenantForm.admin_email" required type="email" placeholder="首位管理员邮箱"><button class="primary">创建并邀请管理员</button></form>
-    <table><thead><tr><th>公司</th><th>标识</th><th>状态</th></tr></thead><tbody><tr v-for="x in tenants" :key="x.id"><td>{{x.name}}</td><td>{{x.slug}}</td><td>{{x.status}}</td></tr></tbody></table>
+    <table><thead><tr><th>公司</th><th>标识</th><th>状态</th><th>操作</th></tr></thead><tbody><tr v-for="x in tenants" :key="x.id"><td>{{x.name}}</td><td>{{x.slug}}</td><td>{{x.status}}</td><td><button v-if="canGovern" class="secondary" @click="changeTenantStatus(x)">{{x.status === 'active' ? '暂停' : '恢复'}}</button></td></tr></tbody></table>
   </section>
 
   <section v-if="tab==='users'" class="panel admin-section"><h2>客户用户治理</h2><form class="inline-form" @submit.prevent="load"><input v-model="query" placeholder="邮箱或姓名"><button class="secondary">查询</button></form>
@@ -115,3 +121,9 @@ onMounted(load)
   <section v-if="tab==='audit'" class="panel admin-section"><h2>全局审计</h2><table><thead><tr><th>时间</th><th>公司</th><th>事件</th><th>操作者</th></tr></thead><tbody><tr v-for="x in audit" :key="x.id"><td>{{new Date(x.created_at).toLocaleString()}}</td><td>{{x.tenant_id||'平台'}}</td><td>{{x.event_type}}</td><td>{{x.actor}}</td></tr></tbody></table></section>
   <section v-if="tab==='system'" class="panel admin-section"><h2>系统状态（只读）</h2><pre>{{JSON.stringify(system,null,2)}}</pre></section>
 </main></template>
+
+<style scoped>
+.platform-page .admin-section table{min-width:760px}.platform-page .admin-section td:first-child{min-width:200px}.platform-page .table-actions button{white-space:nowrap}@media(max-width:800px){.platform-page .admin-section{padding:20px}.platform-page .inline-form input{min-width:150px}}
+.platform-page .admin-tabs button{background:transparent;border:0}.platform-page td small{display:block;margin-top:4px;font-size:11px;color:#8a988f}.platform-page td{vertical-align:middle}.platform-page td:first-child{overflow-wrap:anywhere}
+.governance-header{display:flex;align-items:center;justify-content:space-between;gap:28px;padding:6px 0 28px;margin-bottom:22px;border-bottom:1px solid #dce5db}.governance-heading h1{font-family:inherit;font-size:30px;font-weight:600;letter-spacing:-.03em;line-height:1.35;margin:10px 0}.governance-heading p{font-size:13px;color:#7d8d80;margin:0;line-height:1.7}.governance-actions{display:flex;flex-direction:column;align-items:flex-end;gap:10px;flex-shrink:0}.evaluation-entry{display:inline-flex;align-items:center;justify-content:center;gap:10px;padding:11px 16px;border:1px solid #c7d8c9;border-radius:9px;background:#fff;color:#31624d;font-size:13px;font-weight:600;text-decoration:none;box-shadow:0 3px 8px #23412b05}.evaluation-entry:hover{background:#edf4ed;border-color:#91ae97}.evaluation-entry:focus-visible{outline:2px solid #d77440;outline-offset:3px}.scope-note{color:#90a08f;font-size:10px}.platform-notice{display:flex;align-items:center;gap:12px;max-width:760px;margin:0 0 22px;padding:14px 16px;border-radius:10px;border:1px solid}.notice-success{background:#f1f8f1;border-color:#d0e4d1;color:#426e4d}.notice-error{background:#fff5f1;border-color:#efd8cd;color:#9b5340}.notice-icon{display:grid;place-items:center;width:27px;height:27px;border-radius:50%;background:#deefdf;font-size:13px;flex-shrink:0}.notice-error .notice-icon{background:#f8e5db}.platform-notice strong{font-size:12px;font-weight:600}.platform-notice p{font-size:12px;margin:3px 0 0;line-height:1.6;overflow-wrap:anywhere}.platform-notice button{margin-left:auto;border:0;background:transparent;color:inherit;padding:8px;font-size:20px;line-height:1}.platform-page .admin-tabs{padding:5px;background:#e9eee6;border:1px solid #dfe6da;border-radius:10px;gap:4px;margin-bottom:24px}.platform-page .admin-tabs button{font-size:12px;padding:9px 15px}.platform-page .admin-tabs button.active{background:#fff;color:#2a5741;box-shadow:0 2px 5px #193d2310}.platform-page .metric{padding:21px 23px;box-shadow:0 4px 16px #29432b04;border-color:#e0e7da}.platform-page .metric strong{font-size:29px;font-weight:600}.platform-page .metric span{font-size:12px}.platform-page .admin-section{overflow:auto}.platform-page .admin-section h2{font-size:19px}.platform-page .admin-section>p{font-size:13px;color:#7c8c80}@media(max-width:800px){.governance-header{align-items:flex-start;flex-direction:column;gap:18px}.governance-heading h1{font-size:26px}.governance-actions{align-items:flex-start}.platform-notice{width:100%}.platform-page .admin-tabs button{padding:8px 11px}.platform-page .metric{padding:16px}}
+</style>

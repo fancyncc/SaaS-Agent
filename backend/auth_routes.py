@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_settings
@@ -83,6 +83,7 @@ async def _membership_payload(session: AsyncSession, user_id: str) -> list[dict]
         {
             "tenant_id": tenant.id,
             "tenant_name": tenant.name,
+            "kind": tenant.kind,
             "role": membership.role,
             "company_role_code": membership.company_role_code,
         }
@@ -97,15 +98,17 @@ async def login(
     response: Response,
     session: AsyncSession = Depends(get_session),
 ):
-    email = payload.email.strip().lower()
+    email = (payload.username or payload.email or "").strip().lower()
     ip = request.client.host if request.client else "unknown"
     rate_key = f"login:{ip}:{email}"
     await enforce_rate_limit(rate_key, 8, 900)
-    user = await session.scalar(select(User).where(User.email == email, User.deleted_at.is_(None)))
+    user = await session.scalar(select(User).where(or_(User.username == email, User.email == email), User.deleted_at.is_(None)))
     if (not user or user.status != "active" or user.account_type != "customer"
             or not verify_password(user.password_hash, payload.password)):
-        raise HTTPException(401, "邮箱或密码错误")
+        raise HTTPException(401, "账号或密码错误")
     await clear_rate_limit(rate_key)
+    from backend.onboarding import ensure_personal_space
+    await ensure_personal_space(session, user)
     row = await session.execute(
         select(TenantMembership, Tenant)
         .join(Tenant, Tenant.id == TenantMembership.tenant_id)
@@ -115,7 +118,7 @@ async def login(
             Tenant.status == "active",
             Tenant.deleted_at.is_(None),
         )
-        .order_by(TenantMembership.created_at.asc())
+        .order_by(TenantMembership.workspace_kind.asc(), TenantMembership.created_at.asc())
         .limit(1)
     )
     membership_pair = row.first()
@@ -138,7 +141,7 @@ async def platform_login(
     response: Response,
     session: AsyncSession = Depends(get_session),
 ):
-    email = payload.email.strip().lower()
+    email = (payload.username or payload.email or "").strip().lower()
     ip = request.client.host if request.client else "unknown"
     rate_key = f"platform-login:{ip}:{email}"
     await enforce_rate_limit(rate_key, 8, 900)
@@ -161,13 +164,19 @@ async def platform_login(
 
 @router.get("/me")
 async def me(user: Principal = Depends(current_principal), session: AsyncSession = Depends(get_session)):
+    account = await session.get(User, user.user_id)
     return {
         "data": {
             "id": user.user_id,
-            "email": user.email,
+            "email": account.email if account else None,
+            "username": account.username if account else user.username,
+            "phone": account.phone if account else None,
+            "phone_verified": False,
             "display_name": user.display_name,
             "tenant_id": user.tenant_id,
             "tenant_name": user.tenant_name,
+            "workspace_kind": user.workspace_kind,
+            "email_verified": bool(account and account.email_verified_at),
             "account_type": user.account_type,
             "session_context": user.session_context,
             "role": user.role.value,
@@ -203,26 +212,34 @@ async def accept_invitation(
     session: AsyncSession = Depends(get_session),
 ):
     await enforce_rate_limit(f"invite:{request.client.host if request.client else 'unknown'}", 12, 900)
-    validate_password(payload.password)
-    invitation = await session.scalar(
-        select(UserInvitation).where(UserInvitation.token_hash == token_hash(token))
-    )
+    from backend.onboarding import commit_identity, ensure_personal_space, identity_audit
+
     now = datetime.now(UTC)
-    expires_at = None if not invitation else (
-        invitation.expires_at.replace(tzinfo=UTC)
-        if invitation.expires_at.tzinfo is None
-        else invitation.expires_at
-    )
-    if not invitation or invitation.status != "pending" or not expires_at or expires_at <= now:
+    invitation = await session.scalar(update(UserInvitation).where(
+        UserInvitation.token_hash == token_hash(token), UserInvitation.status == "pending",
+        UserInvitation.expires_at > now,
+    ).values(status="accepted", accepted_at=now).returning(UserInvitation))
+    if not invitation:
         raise HTTPException(410, "邀请无效或已过期")
     tenant = await session.get(Tenant, invitation.tenant_id)
-    if not tenant or tenant.status != "active" or tenant.deleted_at is not None:
+    if not tenant or tenant.kind != "company" or tenant.status != "active" or tenant.deleted_at is not None:
         raise HTTPException(410, "邀请所属企业不可用")
-    user = await session.scalar(select(User).where(User.email == invitation.email))
-    if user and user.deleted_at is not None:
+    user = await session.scalar(select(User).where(User.email == invitation.email).with_for_update())
+    if not user and request.cookies.get(SESSION_COOKIE):
+        principal = await current_principal(request, session)
+        candidate = await session.scalar(select(User).where(User.id == principal.user_id).with_for_update())
+        if not candidate or candidate.account_type != "customer" or candidate.email:
+            raise HTTPException(403, "请使用受邀邮箱对应的账号；未绑定邮箱的账号可直接确认加入")
+        user = candidate
+        user.email = invitation.email
+    if user and (user.deleted_at is not None or user.status != "active"):
         raise HTTPException(409, "该账号不可用，请联系管理员")
     if not user:
+        validate_password(payload.password)
+        if len(payload.display_name.strip()) < 2:
+            raise HTTPException(422, "姓名至少两个字符")
         user = User(
+            **({"username": payload.username.strip().lower()} if payload.username else {}),
             email=invitation.email,
             display_name=payload.display_name.strip(),
             password_hash=hash_password(payload.password),
@@ -233,16 +250,22 @@ async def accept_invitation(
     else:
         if user.account_type != "customer":
             raise HTTPException(409, "平台账号不能接受企业邀请")
+        principal = await current_principal(request, session)
+        if principal.user_id != user.id:
+            raise HTTPException(403, "请登录受邀邮箱对应的账号后确认加入")
+        cookie, header = request.cookies.get(CSRF_COOKIE), request.headers.get("X-CSRF-Token")
+        if not cookie or not header or not secrets.compare_digest(cookie, header):
+            raise HTTPException(403, "CSRF 校验失败")
         other_company = await session.scalar(select(TenantMembership).where(
             TenantMembership.user_id == user.id,
             TenantMembership.tenant_id != invitation.tenant_id,
             TenantMembership.status == "active",
+            TenantMembership.workspace_kind == "company",
         ))
         if other_company:
             raise HTTPException(409, "一个账号只能属于一家公司，请使用该公司的专用邮箱账号")
-        user.display_name = payload.display_name.strip()
-        user.password_hash = hash_password(payload.password)
-        user.status = "active"
+    user.email_verified_at = now
+    await ensure_personal_space(session, user)
     membership = await session.scalar(
         select(TenantMembership).where(
             TenantMembership.tenant_id == invitation.tenant_id,
@@ -250,9 +273,7 @@ async def accept_invitation(
         )
     )
     if membership:
-        membership.role = invitation.role
-        membership.company_role_code = "company_admin" if invitation.role == "tenant_admin" else "company_member"
-        membership.status = "active"
+        raise HTTPException(409, "该账号已有公司成员记录，请在成员管理中处理")
     else:
         session.add(TenantMembership(
             tenant_id=tenant.id,
@@ -262,10 +283,11 @@ async def accept_invitation(
         ))
     invitation.status = "accepted"
     invitation.accepted_at = now
+    session.add(identity_audit(request, user, tenant.id, "membership.activated", invitation.id))
     raw_session, raw_csrf, _ = await create_session(
         session, user, tenant, request.headers.get("user-agent", "")
     )
-    await session.commit()
+    await commit_identity(session)
     _set_auth_cookies(response, raw_session, raw_csrf)
     return {"data": {"accepted": True, "tenant_id": tenant.id}}
 
@@ -333,7 +355,7 @@ async def forgot_password(
     await enforce_rate_limit(f"forgot:{request.client.host if request.client else 'unknown'}:{email}", 5, 3600)
     user = await session.scalar(select(User).where(User.email == email, User.deleted_at.is_(None)))
     preview_url = None
-    if user and user.status == "active":
+    if user and user.status == "active" and user.email:
         raw = secrets.token_urlsafe(48)
         session.add(
             PasswordResetToken(
@@ -342,9 +364,9 @@ async def forgot_password(
                 expires_at=datetime.now(UTC) + timedelta(hours=1),
             )
         )
-        await session.commit()
         preview_url = f"{get_settings().frontend_base_url}/reset-password?token={quote(raw)}"
-        await send_account_link(user.email, "password-reset", preview_url)
+        await send_account_link(user.email, "password-reset", preview_url, session=session)
+        await session.commit()
     data = {"message": "如果邮箱存在，重置链接将发送至该邮箱"}
     if get_settings().mail_debug and preview_url:
         data["preview_url"] = preview_url

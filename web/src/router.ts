@@ -1,6 +1,9 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import ProjectHome from './views/ProjectHome.vue'
+import Workbench from './views/Workbench.vue'
 import RunDetail from './views/RunDetail.vue'
+import TraceView from './views/TraceView.vue'
+import EvaluationsView from './views/EvaluationsView.vue'
 import LoginView from './views/LoginView.vue'
 import InvitationView from './views/InvitationView.vue'
 import PasswordView from './views/PasswordView.vue'
@@ -8,12 +11,19 @@ import AdminView from './views/AdminView.vue'
 import PlatformView from './views/PlatformView.vue'
 import PlatformLoginView from './views/PlatformLoginView.vue'
 import PlatformInvitationView from './views/PlatformInvitationView.vue'
+import RegistrationView from './views/RegistrationView.vue'
+import EmailVerificationView from './views/EmailVerificationView.vue'
+import ProfileView from './views/ProfileView.vue'
+import SpacesView from './views/SpacesView.vue'
+import MemberImportView from './views/MemberImportView.vue'
 import { useAuthStore } from './auth'
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/login', name: 'login', component: LoginView, meta: { public: true } },
+    { path: '/register', name: 'register', component: RegistrationView, meta: { public: true } },
+    { path: '/verify-email', name: 'verify-email', component: EmailVerificationView, meta: { public: true } },
     { path: '/platform/login', name: 'platform-login', component: PlatformLoginView, meta: { public: true } },
     { path: '/accept-invitation', name: 'invitation', component: InvitationView, meta: { public: true } },
     { path: '/accept-platform-invitation', name: 'platform-invitation', component: PlatformInvitationView, meta: { public: true } },
@@ -21,9 +31,15 @@ const router = createRouter({
     { path: '/reset-password', name: 'reset', component: PasswordView, meta: { public: true } },
     { path: '/', redirect: '/app' },
     { path: '/app', name: 'home', component: ProjectHome, meta: { customer: true } },
+    { path: '/app/spaces', component: SpacesView, meta: { customer: true } },
+    { path: '/app/profile', component: ProfileView, meta: { customer: true } },
+    { path: '/app/company/member-imports', component: MemberImportView, meta: { customer: true, companyAdmin: true } },
+    { path: '/app/workbench', name: 'workbench', component: Workbench, meta: { customer: true } },
     { path: '/app/runs/:id', name: 'run', component: RunDetail, meta: { customer: true } },
+    { path: '/app/runs/:id/trace', name: 'trace', component: TraceView, meta: { customer: true } },
     { path: '/app/company', name: 'company-settings', component: AdminView, meta: { customer: true, companyAdmin: true } },
     { path: '/platform', name: 'platform', component: PlatformView, meta: { platform: true } },
+    { path: '/platform/evaluations', name: 'evaluations', component: EvaluationsView, meta: { platform: true } },
   ],
 })
 

@@ -279,10 +279,11 @@ def _upgrade_precreated_fresh_schema(bind: sa.Connection) -> bool:
         "WHEN 'tenant_admin' THEN 'company_admin' ELSE 'company_member' END"
     ))
     bind.execute(sa.text("UPDATE project_memberships SET primary_role_code = project_role"))
-    bind.execute(sa.text("""
+    uuid_expression = "CAST(gen_random_uuid() AS varchar)" if bind.dialect.name == "postgresql" else "lower(hex(randomblob(16)))"
+    bind.execute(sa.text(f"""
         INSERT INTO platform_role_bindings
           (id,user_id,role_code,status,granted_by,created_at)
-        SELECT CAST(gen_random_uuid() AS varchar),u.id,'platform_admin','active',u.id,CURRENT_TIMESTAMP
+        SELECT {uuid_expression},u.id,'platform_admin','active',u.id,CURRENT_TIMESTAMP
         FROM users u WHERE u.is_platform_admin=true
           AND NOT EXISTS (SELECT 1 FROM platform_role_bindings b
             WHERE b.user_id=u.id AND b.role_code='platform_admin')
